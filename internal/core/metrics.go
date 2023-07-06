@@ -1,198 +1,212 @@
 package core
 
 import (
-	"context"
 	"io"
-	"net"
 	"net/http"
 	"strconv"
 	"sync"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/aler9/rtsp-simple-server/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
-func metric(key string, value int64) string {
-	return key + " " + strconv.FormatInt(value, 10) + "\n"
-}
-
-type metricsPathManager interface {
-	onAPIPathsList(req pathAPIPathsListReq) pathAPIPathsListRes
-}
-
-type metricsRTSPServer interface {
-	onAPISessionsList(req rtspServerAPISessionsListReq) rtspServerAPISessionsListRes
-}
-
-type metricsRTMPServer interface {
-	onAPIConnsList(req rtmpServerAPIConnsListReq) rtmpServerAPIConnsListRes
-}
-
-type metricsHLSServer interface {
-	onAPIHLSMuxersList(req hlsServerAPIMuxersListReq) hlsServerAPIMuxersListRes
+func metric(key string, tags string, value int64) string {
+	return key + tags + " " + strconv.FormatInt(value, 10) + "\n"
 }
 
 type metricsParent interface {
-	Log(logger.Level, string, ...interface{})
+	logger.Writer
 }
 
 type metrics struct {
 	parent metricsParent
 
-	ln          net.Listener
-	server      *http.Server
-	mutex       sync.Mutex
-	pathManager metricsPathManager
-	rtspServer  metricsRTSPServer
-	rtspsServer metricsRTSPServer
-	rtmpServer  metricsRTMPServer
-	hlsServer   metricsHLSServer
+	httpServer    *httpServer
+	mutex         sync.Mutex
+	pathManager   apiPathManager
+	rtspServer    apiRTSPServer
+	rtspsServer   apiRTSPServer
+	rtmpServer    apiRTMPServer
+	hlsManager    apiHLSManager
+	webRTCManager apiWebRTCManager
 }
 
 func newMetrics(
 	address string,
+	readTimeout conf.StringDuration,
 	parent metricsParent,
 ) (*metrics, error) {
-	ln, err := net.Listen("tcp", address)
+	m := &metrics{
+		parent: parent,
+	}
+
+	router := gin.New()
+	router.SetTrustedProxies(nil)
+
+	mwLog := httpLoggerMiddleware(m)
+	router.NoRoute(mwLog)
+	router.GET("/metrics", mwLog, m.onMetrics)
+
+	var err error
+	m.httpServer, err = newHTTPServer(
+		address,
+		readTimeout,
+		"",
+		"",
+		router,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	m := &metrics{
-		parent: parent,
-		ln:     ln,
-	}
-
-	router := gin.New()
-	router.GET("/metrics", m.onMetrics)
-
-	m.server = &http.Server{Handler: router}
-
-	m.log(logger.Info, "listener opened on "+address)
-
-	go m.run()
+	m.Log(logger.Info, "listener opened on "+address)
 
 	return m, nil
 }
 
 func (m *metrics) close() {
-	m.server.Shutdown(context.Background())
-	m.log(logger.Info, "listener closed")
+	m.Log(logger.Info, "listener is closing")
+	m.httpServer.close()
 }
 
-func (m *metrics) log(level logger.Level, format string, args ...interface{}) {
+func (m *metrics) Log(level logger.Level, format string, args ...interface{}) {
 	m.parent.Log(level, "[metrics] "+format, args...)
-}
-
-func (m *metrics) run() {
-	err := m.server.Serve(m.ln)
-	if err != http.ErrServerClosed {
-		panic(err)
-	}
 }
 
 func (m *metrics) onMetrics(ctx *gin.Context) {
 	out := ""
 
-	res := m.pathManager.onAPIPathsList(pathAPIPathsListReq{})
-	if res.Err == nil {
-		for name, p := range res.Data.Items {
-			if p.SourceReady {
-				out += metric("paths{name=\""+name+"\",state=\"ready\"}", 1)
+	data, err := m.pathManager.apiPathsList()
+	if err == nil && len(data.Items) != 0 {
+		for _, i := range data.Items {
+			var state string
+			if i.SourceReady {
+				state = "ready"
 			} else {
-				out += metric("paths{name=\""+name+"\",state=\"notReady\"}", 1)
+				state = "notReady"
 			}
+
+			tags := "{name=\"" + i.Name + "\",state=\"" + state + "\"}"
+			out += metric("paths", tags, 1)
+			out += metric("paths_bytes_received", tags, int64(i.BytesReceived))
+		}
+	} else {
+		out += metric("paths", "", 0)
+	}
+
+	if !interfaceIsEmpty(m.hlsManager) {
+		data, err := m.hlsManager.apiMuxersList()
+		if err == nil && len(data.Items) != 0 {
+			for _, i := range data.Items {
+				tags := "{name=\"" + i.Path + "\"}"
+				out += metric("hls_muxers", tags, 1)
+				out += metric("hls_muxers_bytes_sent", tags, int64(i.BytesSent))
+			}
+		} else {
+			out += metric("hls_muxers", "", 0)
+			out += metric("hls_muxers_bytes_sent", "", 0)
 		}
 	}
 
-	if !interfaceIsEmpty(m.rtspServer) {
-		res := m.rtspServer.onAPISessionsList(rtspServerAPISessionsListReq{})
-		if res.Err == nil {
-			idleCount := int64(0)
-			readCount := int64(0)
-			publishCount := int64(0)
-
-			for _, i := range res.Data.Items {
-				switch i.State {
-				case "idle":
-					idleCount++
-				case "read":
-					readCount++
-				case "publish":
-					publishCount++
+	if !interfaceIsEmpty(m.rtspServer) { //nolint:dupl
+		func() {
+			data, err := m.rtspServer.apiConnsList()
+			if err == nil && len(data.Items) != 0 {
+				for _, i := range data.Items {
+					tags := "{id=\"" + i.ID.String() + "\"}"
+					out += metric("rtsp_conns", tags, 1)
+					out += metric("rtsp_conns_bytes_received", tags, int64(i.BytesReceived))
+					out += metric("rtsp_conns_bytes_sent", tags, int64(i.BytesSent))
 				}
+			} else {
+				out += metric("rtsp_conns", "", 0)
+				out += metric("rtsp_conns_bytes_received", "", 0)
+				out += metric("rtsp_conns_bytes_sent", "", 0)
 			}
+		}()
 
-			out += metric("rtsp_sessions{state=\"idle\"}",
-				idleCount)
-			out += metric("rtsp_sessions{state=\"read\"}",
-				readCount)
-			out += metric("rtsp_sessions{state=\"publish\"}",
-				publishCount)
-		}
+		func() {
+			data, err := m.rtspServer.apiSessionsList()
+			if err == nil && len(data.Items) != 0 {
+				for _, i := range data.Items {
+					tags := "{id=\"" + i.ID.String() + "\",state=\"" + i.State + "\"}"
+					out += metric("rtsp_sessions", tags, 1)
+					out += metric("rtsp_sessions_bytes_received", tags, int64(i.BytesReceived))
+					out += metric("rtsp_sessions_bytes_sent", tags, int64(i.BytesSent))
+				}
+			} else {
+				out += metric("rtsp_sessions", "", 0)
+				out += metric("rtsp_sessions_bytes_received", "", 0)
+				out += metric("rtsp_sessions_bytes_sent", "", 0)
+			}
+		}()
 	}
 
-	if !interfaceIsEmpty(m.rtspsServer) {
-		res := m.rtspsServer.onAPISessionsList(rtspServerAPISessionsListReq{})
-		if res.Err == nil {
-			idleCount := int64(0)
-			readCount := int64(0)
-			publishCount := int64(0)
-
-			for _, i := range res.Data.Items {
-				switch i.State {
-				case "idle":
-					idleCount++
-				case "read":
-					readCount++
-				case "publish":
-					publishCount++
+	if !interfaceIsEmpty(m.rtspsServer) { //nolint:dupl
+		func() {
+			data, err := m.rtspsServer.apiConnsList()
+			if err == nil && len(data.Items) != 0 {
+				for _, i := range data.Items {
+					tags := "{id=\"" + i.ID.String() + "\"}"
+					out += metric("rtsps_conns", tags, 1)
+					out += metric("rtsps_conns_bytes_received", tags, int64(i.BytesReceived))
+					out += metric("rtsps_conns_bytes_sent", tags, int64(i.BytesSent))
 				}
+			} else {
+				out += metric("rtsps_conns", "", 0)
+				out += metric("rtsps_conns_bytes_received", "", 0)
+				out += metric("rtsps_conns_bytes_sent", "", 0)
 			}
+		}()
 
-			out += metric("rtsps_sessions{state=\"idle\"}",
-				idleCount)
-			out += metric("rtsps_sessions{state=\"read\"}",
-				readCount)
-			out += metric("rtsps_sessions{state=\"publish\"}",
-				publishCount)
-		}
+		func() {
+			data, err := m.rtspsServer.apiSessionsList()
+			if err == nil && len(data.Items) != 0 {
+				for _, i := range data.Items {
+					tags := "{id=\"" + i.ID.String() + "\",state=\"" + i.State + "\"}"
+					out += metric("rtsps_sessions", tags, 1)
+					out += metric("rtsps_sessions_bytes_received", tags, int64(i.BytesReceived))
+					out += metric("rtsps_sessions_bytes_sent", tags, int64(i.BytesSent))
+				}
+			} else {
+				out += metric("rtsps_sessions", "", 0)
+				out += metric("rtsps_sessions_bytes_received", "", 0)
+				out += metric("rtsps_sessions_bytes_sent", "", 0)
+			}
+		}()
 	}
 
 	if !interfaceIsEmpty(m.rtmpServer) {
-		res := m.rtmpServer.onAPIConnsList(rtmpServerAPIConnsListReq{})
-		if res.Err == nil {
-			idleCount := int64(0)
-			readCount := int64(0)
-			publishCount := int64(0)
-
-			for _, i := range res.Data.Items {
-				switch i.State {
-				case "idle":
-					idleCount++
-				case "read":
-					readCount++
-				case "publish":
-					publishCount++
-				}
+		data, err := m.rtmpServer.apiConnsList()
+		if err == nil && len(data.Items) != 0 {
+			for _, i := range data.Items {
+				tags := "{id=\"" + i.ID.String() + "\",state=\"" + i.State + "\"}"
+				out += metric("rtmp_conns", tags, 1)
+				out += metric("rtmp_conns_bytes_received", tags, int64(i.BytesReceived))
+				out += metric("rtmp_conns_bytes_sent", tags, int64(i.BytesSent))
 			}
-
-			out += metric("rtmp_conns{state=\"idle\"}",
-				idleCount)
-			out += metric("rtmp_conns{state=\"read\"}",
-				readCount)
-			out += metric("rtmp_conns{state=\"publish\"}",
-				publishCount)
+		} else {
+			out += metric("rtmp_conns", "", 0)
+			out += metric("rtmp_conns_bytes_received", "", 0)
+			out += metric("rtmp_conns_bytes_sent", "", 0)
 		}
 	}
 
-	if !interfaceIsEmpty(m.hlsServer) {
-		res := m.hlsServer.onAPIHLSMuxersList(hlsServerAPIMuxersListReq{})
-		if res.Err == nil {
-			for name := range res.Data.Items {
-				out += metric("hls_muxers{name=\""+name+"\"}", 1)
+	if !interfaceIsEmpty(m.webRTCManager) {
+		data, err := m.webRTCManager.apiSessionsList()
+		if err == nil && len(data.Items) != 0 {
+			for _, i := range data.Items {
+				tags := "{id=\"" + i.ID.String() + "\"}"
+				out += metric("webrtc_sessions", tags, 1)
+				out += metric("webrtc_sessions_bytes_received", tags, int64(i.BytesReceived))
+				out += metric("webrtc_sessions_bytes_sent", tags, int64(i.BytesSent))
 			}
+		} else {
+			out += metric("webrtc_sessions", "", 0)
+			out += metric("webrtc_sessions_bytes_received", "", 0)
+			out += metric("webrtc_sessions_bytes_sent", "", 0)
 		}
 	}
 
@@ -200,37 +214,44 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 	io.WriteString(ctx.Writer, out)
 }
 
-// onPathManagerSet is called by pathManager.
-func (m *metrics) onPathManagerSet(s metricsPathManager) {
+// pathManagerSet is called by pathManager.
+func (m *metrics) pathManagerSet(s apiPathManager) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.pathManager = s
 }
 
-// onRTSPServer is called by rtspServer (plain).
-func (m *metrics) onRTSPServerSet(s metricsRTSPServer) {
+// hlsManagerSet is called by hlsManager.
+func (m *metrics) hlsManagerSet(s apiHLSManager) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.hlsManager = s
+}
+
+// rtspServerSet is called by rtspServer (plain).
+func (m *metrics) rtspServerSet(s apiRTSPServer) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.rtspServer = s
 }
 
-// onRTSPServer is called by rtspServer (plain).
-func (m *metrics) onRTSPSServerSet(s metricsRTSPServer) {
+// rtspsServerSet is called by rtspServer (tls).
+func (m *metrics) rtspsServerSet(s apiRTSPServer) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.rtspsServer = s
 }
 
-// onRTMPServerSet is called by rtmpServer.
-func (m *metrics) onRTMPServerSet(s metricsRTMPServer) {
+// rtmpServerSet is called by rtmpServer.
+func (m *metrics) rtmpServerSet(s apiRTMPServer) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.rtmpServer = s
 }
 
-// onHLSServerSet is called by hlsServer.
-func (m *metrics) onHLSServerSet(s metricsHLSServer) {
+// webRTCManagerSet is called by webRTCManager.
+func (m *metrics) webRTCManagerSet(s apiWebRTCManager) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-	m.hlsServer = s
+	m.webRTCManager = s
 }

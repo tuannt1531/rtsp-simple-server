@@ -6,65 +6,32 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aler9/gortsplib"
-	"github.com/aler9/gortsplib/pkg/auth"
-	"github.com/aler9/gortsplib/pkg/base"
+	"github.com/bluenviron/gortsplib/v3"
+	"github.com/bluenviron/gortsplib/v3/pkg/auth"
+	"github.com/bluenviron/gortsplib/v3/pkg/base"
+	"github.com/bluenviron/gortsplib/v3/pkg/media"
+	"github.com/bluenviron/gortsplib/v3/pkg/url"
+	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
 
 type testServer struct {
-	user          string
-	pass          string
-	authValidator *auth.Validator
-	stream        *gortsplib.ServerStream
-
-	done chan struct{}
+	onDescribe func(*gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error)
+	onSetup    func(*gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error)
+	onPlay     func(*gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error)
 }
 
 func (sh *testServer) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx,
 ) (*base.Response, *gortsplib.ServerStream, error) {
-	if sh.authValidator == nil {
-		sh.authValidator = auth.NewValidator(sh.user, sh.pass, nil)
-	}
-
-	err := sh.authValidator.ValidateRequest(ctx.Req)
-	if err != nil {
-		return &base.Response{
-			StatusCode: base.StatusUnauthorized,
-			Header: base.Header{
-				"WWW-Authenticate": sh.authValidator.Header(),
-			},
-		}, nil, nil
-	}
-
-	track, _ := gortsplib.NewTrackH264(96,
-		&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x05, 0x06}})
-	sh.stream = gortsplib.NewServerStream(gortsplib.Tracks{track})
-
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, sh.stream, nil
+	return sh.onDescribe(ctx)
 }
 
 func (sh *testServer) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	if sh.done != nil {
-		close(sh.done)
-	}
-
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, sh.stream, nil
+	return sh.onSetup(ctx)
 }
 
 func (sh *testServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
-	go func() {
-		time.Sleep(1 * time.Second)
-		sh.stream.WritePacketRTP(0, []byte{0x01, 0x02, 0x03, 0x04})
-	}()
-
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, nil
+	return sh.onPlay(ctx)
 }
 
 func TestRTSPSource(t *testing.T) {
@@ -74,8 +41,54 @@ func TestRTSPSource(t *testing.T) {
 		"tls",
 	} {
 		t.Run(source, func(t *testing.T) {
+			medi := testMediaH264
+			stream := gortsplib.NewServerStream(media.Medias{medi})
+			nonce := auth.GenerateNonce()
+
 			s := gortsplib.Server{
-				Handler:     &testServer{user: "testuser", pass: "testpass"},
+				Handler: &testServer{
+					onDescribe: func(ctx *gortsplib.ServerHandlerOnDescribeCtx,
+					) (*base.Response, *gortsplib.ServerStream, error) {
+						err := auth.Validate(ctx.Request, "testuser", "testpass", nil, nil, "IPCAM", nonce)
+						if err != nil {
+							return &base.Response{
+								StatusCode: base.StatusUnauthorized,
+								Header: base.Header{
+									"WWW-Authenticate": auth.GenerateWWWAuthenticate(nil, "IPCAM", nonce),
+								},
+							}, nil, nil
+						}
+
+						return &base.Response{
+							StatusCode: base.StatusOK,
+						}, stream, nil
+					},
+					onSetup: func(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
+						return &base.Response{
+							StatusCode: base.StatusOK,
+						}, stream, nil
+					},
+					onPlay: func(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
+						go func() {
+							time.Sleep(1 * time.Second)
+							stream.WritePacketRTP(medi, &rtp.Packet{
+								Header: rtp.Header{
+									Version:        0x02,
+									PayloadType:    96,
+									SequenceNumber: 57899,
+									Timestamp:      345234345,
+									SSRC:           978651231,
+									Marker:         true,
+								},
+								Payload: []byte{0x01, 0x02, 0x03, 0x04},
+							})
+						}()
+
+						return &base.Response{
+							StatusCode: base.StatusOK,
+						}, nil
+					},
+				},
 				RTSPAddress: "127.0.0.1:8555",
 			}
 
@@ -111,7 +124,7 @@ func TestRTSPSource(t *testing.T) {
 					"    sourceProtocol: " + source + "\n" +
 					"    sourceOnDemand: yes\n")
 				require.Equal(t, true, ok)
-				defer p.close()
+				defer p.Close()
 			} else {
 				p, ok := newInstance("paths:\n" +
 					"  proxied:\n" +
@@ -119,23 +132,33 @@ func TestRTSPSource(t *testing.T) {
 					"    sourceFingerprint: 33949E05FFFB5FF3E8AA16F8213A6251B4D9363804BA53233C4DA9A46D6F2739\n" +
 					"    sourceOnDemand: yes\n")
 				require.Equal(t, true, ok)
-				defer p.close()
+				defer p.Close()
 			}
-
-			time.Sleep(1 * time.Second)
 
 			received := make(chan struct{})
 
-			c := gortsplib.Client{
-				OnPacketRTP: func(trackID int, payload []byte) {
-					require.Equal(t, []byte{0x01, 0x02, 0x03, 0x04}, payload)
-					close(received)
-				},
-			}
+			c := gortsplib.Client{}
 
-			err = c.StartReading("rtsp://127.0.0.1:8554/proxied")
+			u, err := url.Parse("rtsp://127.0.0.1:8554/proxied")
+			require.NoError(t, err)
+
+			err = c.Start(u.Scheme, u.Host)
 			require.NoError(t, err)
 			defer c.Close()
+
+			medias, baseURL, _, err := c.Describe(u)
+			require.NoError(t, err)
+
+			err = c.SetupAll(medias, baseURL)
+			require.NoError(t, err)
+
+			c.OnPacketRTP(medias[0], medias[0].Formats[0], func(pkt *rtp.Packet) {
+				require.Equal(t, []byte{0x01, 0x02, 0x03, 0x04}, pkt.Payload)
+				close(received)
+			})
+
+			_, err = c.Play(nil)
+			require.NoError(t, err)
 
 			<-received
 		})
@@ -143,9 +166,39 @@ func TestRTSPSource(t *testing.T) {
 }
 
 func TestRTSPSourceNoPassword(t *testing.T) {
+	stream := gortsplib.NewServerStream(media.Medias{testMediaH264})
+	nonce := auth.GenerateNonce()
 	done := make(chan struct{})
+
 	s := gortsplib.Server{
-		Handler:     &testServer{user: "testuser", done: done},
+		Handler: &testServer{
+			onDescribe: func(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
+				err := auth.Validate(ctx.Request, "testuser", "", nil, nil, "IPCAM", nonce)
+				if err != nil {
+					return &base.Response{
+						StatusCode: base.StatusUnauthorized,
+						Header: base.Header{
+							"WWW-Authenticate": auth.GenerateWWWAuthenticate(nil, "IPCAM", nonce),
+						},
+					}, nil, nil
+				}
+
+				return &base.Response{
+					StatusCode: base.StatusOK,
+				}, stream, nil
+			},
+			onSetup: func(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
+				close(done)
+				return &base.Response{
+					StatusCode: base.StatusOK,
+				}, stream, nil
+			},
+			onPlay: func(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
+				return &base.Response{
+					StatusCode: base.StatusOK,
+				}, nil
+			},
+		},
 		RTSPAddress: "127.0.0.1:8555",
 	}
 	err := s.Start()
@@ -155,12 +208,84 @@ func TestRTSPSourceNoPassword(t *testing.T) {
 
 	p, ok := newInstance("rtmpDisable: yes\n" +
 		"hlsDisable: yes\n" +
+		"webrtcDisable: yes\n" +
 		"paths:\n" +
 		"  proxied:\n" +
 		"    source: rtsp://testuser:@127.0.0.1:8555/teststream\n" +
 		"    sourceProtocol: tcp\n")
 	require.Equal(t, true, ok)
-	defer p.close()
+	defer p.Close()
 
 	<-done
+}
+
+func TestRTSPSourceRange(t *testing.T) {
+	for _, ca := range []string{"clock", "npt", "smpte"} {
+		t.Run(ca, func(t *testing.T) {
+			stream := gortsplib.NewServerStream(media.Medias{testMediaH264})
+			done := make(chan struct{})
+
+			s := gortsplib.Server{
+				Handler: &testServer{
+					onDescribe: func(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
+						return &base.Response{
+							StatusCode: base.StatusOK,
+						}, stream, nil
+					},
+					onSetup: func(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
+						return &base.Response{
+							StatusCode: base.StatusOK,
+						}, stream, nil
+					},
+					onPlay: func(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
+						switch ca {
+						case "clock":
+							require.Equal(t, base.HeaderValue{"clock=20230812T120000Z-"}, ctx.Request.Header["Range"])
+
+						case "npt":
+							require.Equal(t, base.HeaderValue{"npt=0.35-"}, ctx.Request.Header["Range"])
+
+						case "smpte":
+							require.Equal(t, base.HeaderValue{"smpte=0:02:10-"}, ctx.Request.Header["Range"])
+						}
+
+						close(done)
+						return &base.Response{
+							StatusCode: base.StatusOK,
+						}, nil
+					},
+				},
+				RTSPAddress: "127.0.0.1:8555",
+			}
+			err := s.Start()
+			require.NoError(t, err)
+			defer s.Wait()
+			defer s.Close()
+
+			var addConf string
+			switch ca {
+			case "clock":
+				addConf += "    rtspRangeType: clock\n" +
+					"    rtspRangeStart: 20230812T120000Z\n"
+
+			case "npt":
+				addConf += "    rtspRangeType: npt\n" +
+					"    rtspRangeStart: 350ms\n"
+
+			case "smpte":
+				addConf += "    rtspRangeType: smpte\n" +
+					"    rtspRangeStart: 130s\n"
+			}
+			p, ok := newInstance("rtmpDisable: yes\n" +
+				"hlsDisable: yes\n" +
+				"webrtcDisable: yes\n" +
+				"paths:\n" +
+				"  proxied:\n" +
+				"    source: rtsp://testuser:@127.0.0.1:8555/teststream\n" + addConf)
+			require.Equal(t, true, ok)
+			defer p.Close()
+
+			<-done
+		})
+	}
 }

@@ -1,4 +1,3 @@
-
 linters:
   enable:
   - bodyclose
@@ -8,10 +7,10 @@ linters:
   - gocritic
   - gofmt
   - gofumpt
-  - golint
   - misspell
   - lll
   - prealloc
+  - revive
   - unconvert
   - whitespace
   disable:
@@ -19,3 +18,11 @@ linters:
 
 issues:
   exclude-use-default: false
+
+linters-settings:
+  govet:
+    enable-all: true
+    disable:
+    - fieldalignment
+    - reflectvaluecompare
+    - shadow

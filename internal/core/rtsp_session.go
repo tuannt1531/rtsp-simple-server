@@ -1,163 +1,161 @@
 package core
 
 import (
-	"errors"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/aler9/gortsplib"
-	"github.com/aler9/gortsplib/pkg/base"
+	"github.com/bluenviron/gortsplib/v3"
+	"github.com/bluenviron/gortsplib/v3/pkg/auth"
+	"github.com/bluenviron/gortsplib/v3/pkg/base"
+	"github.com/bluenviron/gortsplib/v3/pkg/url"
+	"github.com/google/uuid"
+	"github.com/pion/rtp"
 
-	"github.com/aler9/rtsp-simple-server/internal/conf"
-	"github.com/aler9/rtsp-simple-server/internal/externalcmd"
-	"github.com/aler9/rtsp-simple-server/internal/logger"
-)
-
-const (
-	pauseAfterAuthError = 2 * time.Second
+	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/externalcmd"
+	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
 type rtspSessionPathManager interface {
-	onPublisherAnnounce(req pathPublisherAnnounceReq) pathPublisherAnnounceRes
-	onReaderSetupPlay(req pathReaderSetupPlayReq) pathReaderSetupPlayRes
+	publisherAdd(req pathPublisherAddReq) pathPublisherAnnounceRes
+	readerAdd(req pathReaderAddReq) pathReaderSetupPlayRes
 }
 
 type rtspSessionParent interface {
-	log(logger.Level, string, ...interface{})
+	logger.Writer
 }
 
 type rtspSession struct {
-	isTLS       bool
-	rtspAddress string
-	protocols   map[conf.Protocol]struct{}
-	id          string
-	ss          *gortsplib.ServerSession
-	author      *gortsplib.ServerConn
-	pathManager rtspSessionPathManager
-	parent      rtspSessionParent
+	isTLS           bool
+	protocols       map[conf.Protocol]struct{}
+	session         *gortsplib.ServerSession
+	author          *gortsplib.ServerConn
+	externalCmdPool *externalcmd.Pool
+	pathManager     rtspSessionPathManager
+	parent          rtspSessionParent
 
-	path            *path
-	state           gortsplib.ServerSessionState
-	stateMutex      sync.Mutex
-	setuppedTracks  map[int]*gortsplib.Track // read
-	onReadCmd       *externalcmd.Cmd         // read
-	announcedTracks gortsplib.Tracks         // publish
-	stream          *stream                  // publish
+	uuid      uuid.UUID
+	created   time.Time
+	path      *path
+	stream    *stream
+	onReadCmd *externalcmd.Cmd // read
+	mutex     sync.Mutex
+	state     gortsplib.ServerSessionState
+	pathName  string
 }
 
 func newRTSPSession(
 	isTLS bool,
-	rtspAddress string,
 	protocols map[conf.Protocol]struct{},
-	id string,
-	ss *gortsplib.ServerSession,
+	session *gortsplib.ServerSession,
 	sc *gortsplib.ServerConn,
+	externalCmdPool *externalcmd.Pool,
 	pathManager rtspSessionPathManager,
-	parent rtspSessionParent) *rtspSession {
+	parent rtspSessionParent,
+) *rtspSession {
 	s := &rtspSession{
-		isTLS:       isTLS,
-		rtspAddress: rtspAddress,
-		protocols:   protocols,
-		id:          id,
-		ss:          ss,
-		author:      sc,
-		pathManager: pathManager,
-		parent:      parent,
+		isTLS:           isTLS,
+		protocols:       protocols,
+		session:         session,
+		author:          sc,
+		externalCmdPool: externalCmdPool,
+		pathManager:     pathManager,
+		parent:          parent,
+		uuid:            uuid.New(),
+		created:         time.Now(),
 	}
 
-	s.log(logger.Info, "opened by %v", s.author.NetConn().RemoteAddr())
+	s.Log(logger.Info, "created by %v", s.author.NetConn().RemoteAddr())
 
 	return s
 }
 
 // Close closes a Session.
 func (s *rtspSession) close() {
-	s.ss.Close()
+	s.session.Close()
 }
 
-// IsRTSPSession implements pathRTSPSession.
-func (s *rtspSession) IsRTSPSession() {}
-
-// ID returns the public ID of the session.
-func (s *rtspSession) ID() string {
-	return s.id
-}
-
-func (s *rtspSession) safeState() gortsplib.ServerSessionState {
-	s.stateMutex.Lock()
-	defer s.stateMutex.Unlock()
-	return s.state
-}
-
-// RemoteAddr returns the remote address of the author of the session.
-func (s *rtspSession) RemoteAddr() net.Addr {
+func (s *rtspSession) remoteAddr() net.Addr {
 	return s.author.NetConn().RemoteAddr()
 }
 
-func (s *rtspSession) log(level logger.Level, format string, args ...interface{}) {
-	s.parent.log(level, "[session %s] "+format, append([]interface{}{s.id}, args...)...)
+func (s *rtspSession) Log(level logger.Level, format string, args ...interface{}) {
+	id := hex.EncodeToString(s.uuid[:4])
+	s.parent.Log(level, "[session %s] "+format, append([]interface{}{id}, args...)...)
 }
 
 // onClose is called by rtspServer.
 func (s *rtspSession) onClose(err error) {
-	if s.ss.State() == gortsplib.ServerSessionStateRead {
+	if s.session.State() == gortsplib.ServerSessionStatePlay {
 		if s.onReadCmd != nil {
 			s.onReadCmd.Close()
 			s.onReadCmd = nil
-			s.log(logger.Info, "runOnRead command stopped")
+			s.Log(logger.Info, "runOnRead command stopped")
 		}
 	}
 
-	switch s.ss.State() {
-	case gortsplib.ServerSessionStatePreRead, gortsplib.ServerSessionStateRead:
-		s.path.onReaderRemove(pathReaderRemoveReq{Author: s})
-		s.path = nil
+	switch s.session.State() {
+	case gortsplib.ServerSessionStatePrePlay, gortsplib.ServerSessionStatePlay:
+		s.path.readerRemove(pathReaderRemoveReq{author: s})
 
-	case gortsplib.ServerSessionStatePrePublish, gortsplib.ServerSessionStatePublish:
-		s.path.onPublisherRemove(pathPublisherRemoveReq{Author: s})
-		s.path = nil
+	case gortsplib.ServerSessionStatePreRecord, gortsplib.ServerSessionStateRecord:
+		s.path.publisherRemove(pathPublisherRemoveReq{author: s})
 	}
 
-	s.log(logger.Info, "closed (%v)", err)
+	s.path = nil
+	s.stream = nil
+
+	s.Log(logger.Info, "destroyed (%v)", err)
 }
 
 // onAnnounce is called by rtspServer.
 func (s *rtspSession) onAnnounce(c *rtspConn, ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
-	res := s.pathManager.onPublisherAnnounce(pathPublisherAnnounceReq{
-		Author:   s,
-		PathName: ctx.Path,
-		IP:       ctx.Conn.NetConn().RemoteAddr().(*net.TCPAddr).IP,
-		ValidateCredentials: func(pathUser conf.Credential, pathPass conf.Credential) error {
-			return c.validateCredentials(pathUser, pathPass, ctx.Req)
+	if len(ctx.Path) == 0 || ctx.Path[0] != '/' {
+		return &base.Response{
+			StatusCode: base.StatusBadRequest,
+		}, fmt.Errorf("invalid path")
+	}
+	ctx.Path = ctx.Path[1:]
+
+	if c.authNonce == "" {
+		c.authNonce = auth.GenerateNonce()
+	}
+
+	res := s.pathManager.publisherAdd(pathPublisherAddReq{
+		author:   s,
+		pathName: ctx.Path,
+		credentials: authCredentials{
+			query:       ctx.Query,
+			ip:          c.ip(),
+			proto:       authProtocolRTSP,
+			id:          &c.uuid,
+			rtspRequest: ctx.Request,
+			rtspBaseURL: nil,
+			rtspNonce:   c.authNonce,
 		},
 	})
 
-	if res.Err != nil {
-		switch terr := res.Err.(type) {
-		case pathErrAuthNotCritical:
-			return terr.Response, nil
-
-		case pathErrAuthCritical:
-			// wait some seconds to stop brute force attacks
-			<-time.After(pauseAfterAuthError)
-
-			return terr.Response, errors.New(terr.Message)
+	if res.err != nil {
+		switch terr := res.err.(type) {
+		case pathErrAuth:
+			return c.handleAuthError(terr.wrapped)
 
 		default:
 			return &base.Response{
 				StatusCode: base.StatusBadRequest,
-			}, res.Err
+			}, res.err
 		}
 	}
 
-	s.path = res.Path
-	s.announcedTracks = ctx.Tracks
+	s.path = res.path
 
-	s.stateMutex.Lock()
-	s.state = gortsplib.ServerSessionStatePrePublish
-	s.stateMutex.Unlock()
+	s.mutex.Lock()
+	s.state = gortsplib.ServerSessionStatePreRecord
+	s.pathName = ctx.Path
+	s.mutex.Unlock()
 
 	return &base.Response{
 		StatusCode: base.StatusOK,
@@ -167,6 +165,13 @@ func (s *rtspSession) onAnnounce(c *rtspConn, ctx *gortsplib.ServerHandlerOnAnno
 // onSetup is called by rtspServer.
 func (s *rtspSession) onSetup(c *rtspConn, ctx *gortsplib.ServerHandlerOnSetupCtx,
 ) (*base.Response, *gortsplib.ServerStream, error) {
+	if len(ctx.Path) == 0 || ctx.Path[0] != '/' {
+		return &base.Response{
+			StatusCode: base.StatusBadRequest,
+		}, nil, fmt.Errorf("invalid path")
+	}
+	ctx.Path = ctx.Path[1:]
+
 	// in case the client is setupping a stream with UDP or UDP-multicast, and these
 	// transport protocols are disabled, gortsplib already blocks the request.
 	// we have only to handle the case in which the transport protocol is TCP
@@ -179,60 +184,68 @@ func (s *rtspSession) onSetup(c *rtspConn, ctx *gortsplib.ServerHandlerOnSetupCt
 		}
 	}
 
-	switch s.ss.State() {
-	case gortsplib.ServerSessionStateInitial, gortsplib.ServerSessionStatePreRead: // play
-		res := s.pathManager.onReaderSetupPlay(pathReaderSetupPlayReq{
-			Author:   s,
-			PathName: ctx.Path,
-			IP:       ctx.Conn.NetConn().RemoteAddr().(*net.TCPAddr).IP,
-			ValidateCredentials: func(pathUser conf.Credential, pathPass conf.Credential) error {
-				return c.validateCredentials(pathUser, pathPass, ctx.Req)
+	switch s.session.State() {
+	case gortsplib.ServerSessionStateInitial, gortsplib.ServerSessionStatePrePlay: // play
+		baseURL := &url.URL{
+			Scheme:   ctx.Request.URL.Scheme,
+			Host:     ctx.Request.URL.Host,
+			Path:     ctx.Path,
+			RawQuery: ctx.Query,
+		}
+
+		if ctx.Query != "" {
+			baseURL.RawQuery += "/"
+		} else {
+			baseURL.Path += "/"
+		}
+
+		if c.authNonce == "" {
+			c.authNonce = auth.GenerateNonce()
+		}
+
+		res := s.pathManager.readerAdd(pathReaderAddReq{
+			author:   s,
+			pathName: ctx.Path,
+			credentials: authCredentials{
+				query:       ctx.Query,
+				ip:          c.ip(),
+				proto:       authProtocolRTSP,
+				id:          &c.uuid,
+				rtspRequest: ctx.Request,
+				rtspBaseURL: baseURL,
+				rtspNonce:   c.authNonce,
 			},
 		})
 
-		if res.Err != nil {
-			switch terr := res.Err.(type) {
-			case pathErrAuthNotCritical:
-				return terr.Response, nil, nil
-
-			case pathErrAuthCritical:
-				// wait some seconds to stop brute force attacks
-				<-time.After(pauseAfterAuthError)
-
-				return terr.Response, nil, errors.New(terr.Message)
+		if res.err != nil {
+			switch terr := res.err.(type) {
+			case pathErrAuth:
+				res, err := c.handleAuthError(terr.wrapped)
+				return res, nil, err
 
 			case pathErrNoOnePublishing:
 				return &base.Response{
 					StatusCode: base.StatusNotFound,
-				}, nil, res.Err
+				}, nil, res.err
 
 			default:
 				return &base.Response{
 					StatusCode: base.StatusBadRequest,
-				}, nil, res.Err
+				}, nil, res.err
 			}
 		}
 
-		s.path = res.Path
+		s.path = res.path
+		s.stream = res.stream
 
-		if ctx.TrackID >= len(res.Stream.tracks()) {
-			return &base.Response{
-				StatusCode: base.StatusBadRequest,
-			}, nil, fmt.Errorf("track %d does not exist", ctx.TrackID)
-		}
-
-		if s.setuppedTracks == nil {
-			s.setuppedTracks = make(map[int]*gortsplib.Track)
-		}
-		s.setuppedTracks[ctx.TrackID] = res.Stream.tracks()[ctx.TrackID]
-
-		s.stateMutex.Lock()
-		s.state = gortsplib.ServerSessionStatePreRead
-		s.stateMutex.Unlock()
+		s.mutex.Lock()
+		s.state = gortsplib.ServerSessionStatePrePlay
+		s.pathName = ctx.Path
+		s.mutex.Unlock()
 
 		return &base.Response{
 			StatusCode: base.StatusOK,
-		}, res.Stream.rtspStream, nil
+		}, res.stream.rtspStream, nil
 
 	default: // record
 		return &base.Response{
@@ -242,24 +255,32 @@ func (s *rtspSession) onSetup(c *rtspConn, ctx *gortsplib.ServerHandlerOnSetupCt
 }
 
 // onPlay is called by rtspServer.
-func (s *rtspSession) onPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
+func (s *rtspSession) onPlay(_ *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
 	h := make(base.Header)
 
-	if s.ss.State() == gortsplib.ServerSessionStatePreRead {
-		s.path.onReaderPlay(pathReaderPlayReq{Author: s})
+	if s.session.State() == gortsplib.ServerSessionStatePrePlay {
+		s.Log(logger.Info, "is reading from path '%s', with %s, %s",
+			s.path.name,
+			s.session.SetuppedTransport(),
+			sourceMediaInfo(s.session.SetuppedMedias()))
 
-		if s.path.Conf().RunOnRead != "" {
-			s.log(logger.Info, "runOnRead command started")
-			_, port, _ := net.SplitHostPort(s.rtspAddress)
-			s.onReadCmd = externalcmd.New(s.path.Conf().RunOnRead, s.path.Conf().RunOnReadRestart, externalcmd.Environment{
-				Path: s.path.Name(),
-				Port: port,
-			})
+		pathConf := s.path.safeConf()
+
+		if pathConf.RunOnRead != "" {
+			s.Log(logger.Info, "runOnRead command started")
+			s.onReadCmd = externalcmd.NewCmd(
+				s.externalCmdPool,
+				pathConf.RunOnRead,
+				pathConf.RunOnReadRestart,
+				s.path.externalCmdEnv(),
+				func(err error) {
+					s.Log(logger.Info, "runOnRead command exited: %v", err)
+				})
 		}
 
-		s.stateMutex.Lock()
-		s.state = gortsplib.ServerSessionStateRead
-		s.stateMutex.Unlock()
+		s.mutex.Lock()
+		s.state = gortsplib.ServerSessionStatePlay
+		s.mutex.Unlock()
 	}
 
 	return &base.Response{
@@ -270,21 +291,38 @@ func (s *rtspSession) onPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respo
 
 // onRecord is called by rtspServer.
 func (s *rtspSession) onRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
-	res := s.path.onPublisherRecord(pathPublisherRecordReq{
-		Author: s,
-		Tracks: s.announcedTracks,
+	res := s.path.publisherStart(pathPublisherStartReq{
+		author:             s,
+		medias:             s.session.AnnouncedMedias(),
+		generateRTPPackets: false,
 	})
-	if res.Err != nil {
+	if res.err != nil {
 		return &base.Response{
 			StatusCode: base.StatusBadRequest,
-		}, res.Err
+		}, res.err
 	}
 
-	s.stream = res.Stream
+	s.Log(logger.Info, "is publishing to path '%s', with %s, %s",
+		s.path.name,
+		s.session.SetuppedTransport(),
+		sourceMediaInfo(s.session.AnnouncedMedias()))
 
-	s.stateMutex.Lock()
-	s.state = gortsplib.ServerSessionStatePublish
-	s.stateMutex.Unlock()
+	s.stream = res.stream
+
+	for _, medi := range s.session.AnnouncedMedias() {
+		for _, forma := range medi.Formats {
+			cmedi := medi
+			cforma := forma
+
+			ctx.Session.OnPacketRTP(cmedi, cforma, func(pkt *rtp.Packet) {
+				res.stream.writeRTPPacket(cmedi, cforma, pkt, time.Now())
+			})
+		}
+	}
+
+	s.mutex.Lock()
+	s.state = gortsplib.ServerSessionStateRecord
+	s.mutex.Unlock()
 
 	return &base.Response{
 		StatusCode: base.StatusOK,
@@ -292,26 +330,24 @@ func (s *rtspSession) onRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.R
 }
 
 // onPause is called by rtspServer.
-func (s *rtspSession) onPause(ctx *gortsplib.ServerHandlerOnPauseCtx) (*base.Response, error) {
-	switch s.ss.State() {
-	case gortsplib.ServerSessionStateRead:
+func (s *rtspSession) onPause(_ *gortsplib.ServerHandlerOnPauseCtx) (*base.Response, error) {
+	switch s.session.State() {
+	case gortsplib.ServerSessionStatePlay:
 		if s.onReadCmd != nil {
-			s.log(logger.Info, "runOnRead command stopped")
+			s.Log(logger.Info, "runOnRead command stopped")
 			s.onReadCmd.Close()
 		}
 
-		s.path.onReaderPause(pathReaderPauseReq{Author: s})
+		s.mutex.Lock()
+		s.state = gortsplib.ServerSessionStatePrePlay
+		s.mutex.Unlock()
 
-		s.stateMutex.Lock()
-		s.state = gortsplib.ServerSessionStatePreRead
-		s.stateMutex.Unlock()
+	case gortsplib.ServerSessionStateRecord:
+		s.path.publisherStop(pathPublisherStopReq{author: s})
 
-	case gortsplib.ServerSessionStatePublish:
-		s.path.onPublisherPause(pathPublisherPauseReq{Author: s})
-
-		s.stateMutex.Lock()
-		s.state = gortsplib.ServerSessionStatePrePublish
-		s.stateMutex.Unlock()
+		s.mutex.Lock()
+		s.state = gortsplib.ServerSessionStatePreRecord
+		s.mutex.Unlock()
 	}
 
 	return &base.Response{
@@ -319,90 +355,56 @@ func (s *rtspSession) onPause(ctx *gortsplib.ServerHandlerOnPauseCtx) (*base.Res
 	}, nil
 }
 
-// onReaderAccepted implements reader.
-func (s *rtspSession) onReaderAccepted() {
-	tracksLen := len(s.ss.SetuppedTracks())
-
-	s.log(logger.Info, "is reading from path '%s', %d %s with %s",
-		s.path.Name(),
-		tracksLen,
-		func() string {
-			if tracksLen == 1 {
-				return "track"
+// apiReaderDescribe implements reader.
+func (s *rtspSession) apiReaderDescribe() pathAPISourceOrReader {
+	return pathAPISourceOrReader{
+		Type: func() string {
+			if s.isTLS {
+				return "rtspsSession"
 			}
-			return "tracks"
+			return "rtspSession"
 		}(),
-		s.ss.SetuppedTransport())
-}
-
-// onReaderPacketRTP implements reader.
-func (s *rtspSession) onReaderPacketRTP(trackID int, payload []byte) {
-	s.ss.WritePacketRTP(trackID, payload)
-}
-
-// onReaderPacketRTCP implements reader.
-func (s *rtspSession) onReaderPacketRTCP(trackID int, payload []byte) {
-	s.ss.WritePacketRTCP(trackID, payload)
-}
-
-// onReaderAPIDescribe implements reader.
-func (s *rtspSession) onReaderAPIDescribe() interface{} {
-	var typ string
-	if s.isTLS {
-		typ = "rtspsSession"
-	} else {
-		typ = "rtspSession"
+		ID: s.uuid.String(),
 	}
-
-	return struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-	}{typ, s.id}
 }
 
-// onSourceAPIDescribe implements source.
-func (s *rtspSession) onSourceAPIDescribe() interface{} {
-	var typ string
-	if s.isTLS {
-		typ = "rtspsSession"
-	} else {
-		typ = "rtspSession"
-	}
-
-	return struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-	}{typ, s.id}
+// apiSourceDescribe implements source.
+func (s *rtspSession) apiSourceDescribe() pathAPISourceOrReader {
+	return s.apiReaderDescribe()
 }
 
-// onPublisherAccepted implements publisher.
-func (s *rtspSession) onPublisherAccepted(tracksLen int) {
-	s.log(logger.Info, "is publishing to path '%s', %d %s with %s",
-		s.path.Name(),
-		tracksLen,
-		func() string {
-			if tracksLen == 1 {
-				return "track"
+// onPacketLost is called by rtspServer.
+func (s *rtspSession) onPacketLost(ctx *gortsplib.ServerHandlerOnPacketLostCtx) {
+	s.Log(logger.Warn, ctx.Error.Error())
+}
+
+// onDecodeError is called by rtspServer.
+func (s *rtspSession) onDecodeError(ctx *gortsplib.ServerHandlerOnDecodeErrorCtx) {
+	s.Log(logger.Warn, ctx.Error.Error())
+}
+
+func (s *rtspSession) apiItem() *apiRTSPSession {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	return &apiRTSPSession{
+		ID:         s.uuid,
+		Created:    s.created,
+		RemoteAddr: s.remoteAddr().String(),
+		State: func() string {
+			switch s.state {
+			case gortsplib.ServerSessionStatePrePlay,
+				gortsplib.ServerSessionStatePlay:
+				return "read"
+
+			case gortsplib.ServerSessionStatePreRecord,
+				gortsplib.ServerSessionStateRecord:
+				return "publish"
 			}
-			return "tracks"
+			return "idle"
 		}(),
-		s.ss.SetuppedTransport())
-}
-
-// onPacketRTP is called by rtspServer.
-func (s *rtspSession) onPacketRTP(ctx *gortsplib.ServerHandlerOnPacketRTPCtx) {
-	if s.ss.State() != gortsplib.ServerSessionStatePublish {
-		return
+		Path:          s.pathName,
+		BytesReceived: s.session.BytesReceived(),
+		BytesSent:     s.session.BytesSent(),
 	}
-
-	s.stream.onPacketRTP(ctx.TrackID, ctx.Payload)
-}
-
-// onPacketRTCP is called by rtspServer.
-func (s *rtspSession) onPacketRTCP(ctx *gortsplib.ServerHandlerOnPacketRTCPCtx) {
-	if s.ss.State() != gortsplib.ServerSessionStatePublish {
-		return
-	}
-
-	s.stream.onPacketRTCP(ctx.TrackID, ctx.Payload)
 }

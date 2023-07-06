@@ -4,20 +4,19 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"io"
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/aler9/gortsplib"
+	"github.com/bluenviron/gortsplib/v3"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/nacl/secretbox"
 
-	"github.com/aler9/rtsp-simple-server/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
 func writeTempFile(byts []byte) (string, error) {
-	tmpf, err := ioutil.TempFile(os.TempDir(), "rtsp-")
+	tmpf, err := os.CreateTemp(os.TempDir(), "rtsp-")
 	if err != nil {
 		return "", err
 	}
@@ -52,6 +51,17 @@ func TestConfFromFile(t *testing.T) {
 			Source:                     "publisher",
 			SourceOnDemandStartTimeout: 10 * StringDuration(time.Second),
 			SourceOnDemandCloseAfter:   10 * StringDuration(time.Second),
+			RPICameraWidth:             1920,
+			RPICameraHeight:            1080,
+			RPICameraContrast:          1,
+			RPICameraSaturation:        1,
+			RPICameraSharpness:         1,
+			RPICameraFPS:               30,
+			RPICameraIDRPeriod:         60,
+			RPICameraBitrate:           1000000,
+			RPICameraProfile:           "main",
+			RPICameraLevel:             "4.1",
+			RPICameraTextOverlay:       "%Y-%m-%d %H:%M:%S - MediaMTX",
 			RunOnDemandStartTimeout:    5 * StringDuration(time.Second),
 			RunOnDemandCloseAfter:      10 * StringDuration(time.Second),
 		}, pa)
@@ -88,8 +98,8 @@ func TestConfFromFile(t *testing.T) {
 }
 
 func TestConfFromFileAndEnv(t *testing.T) {
-	os.Setenv("RTSP_PATHS_CAM1_SOURCE", "rtsp://testing")
-	defer os.Unsetenv("RTSP_PATHS_CAM1_SOURCE")
+	os.Setenv("MTX_PATHS_CAM1_SOURCE", "rtsp://testing")
+	defer os.Unsetenv("MTX_PATHS_CAM1_SOURCE")
 
 	os.Setenv("RTSP_PROTOCOLS", "tcp")
 	defer os.Unsetenv("RTSP_PROTOCOLS")
@@ -110,16 +120,27 @@ func TestConfFromFileAndEnv(t *testing.T) {
 		Source:                     "rtsp://testing",
 		SourceOnDemandStartTimeout: 10 * StringDuration(time.Second),
 		SourceOnDemandCloseAfter:   10 * StringDuration(time.Second),
+		RPICameraWidth:             1920,
+		RPICameraHeight:            1080,
+		RPICameraContrast:          1,
+		RPICameraSaturation:        1,
+		RPICameraSharpness:         1,
+		RPICameraFPS:               30,
+		RPICameraIDRPeriod:         60,
+		RPICameraBitrate:           1000000,
+		RPICameraProfile:           "main",
+		RPICameraLevel:             "4.1",
+		RPICameraTextOverlay:       "%Y-%m-%d %H:%M:%S - MediaMTX",
 		RunOnDemandStartTimeout:    10 * StringDuration(time.Second),
 		RunOnDemandCloseAfter:      10 * StringDuration(time.Second),
 	}, pa)
 }
 
 func TestConfFromEnvOnly(t *testing.T) {
-	os.Setenv("RTSP_PATHS_CAM1_SOURCE", "rtsp://testing")
-	defer os.Unsetenv("RTSP_PATHS_CAM1_SOURCE")
+	os.Setenv("MTX_PATHS_CAM1_SOURCE", "rtsp://testing")
+	defer os.Unsetenv("MTX_PATHS_CAM1_SOURCE")
 
-	conf, hasFile, err := Load("rtsp-simple-server.yml")
+	conf, hasFile, err := Load("mediamtx.yml")
 	require.NoError(t, err)
 	require.Equal(t, false, hasFile)
 
@@ -129,6 +150,17 @@ func TestConfFromEnvOnly(t *testing.T) {
 		Source:                     "rtsp://testing",
 		SourceOnDemandStartTimeout: 10 * StringDuration(time.Second),
 		SourceOnDemandCloseAfter:   10 * StringDuration(time.Second),
+		RPICameraWidth:             1920,
+		RPICameraHeight:            1080,
+		RPICameraContrast:          1,
+		RPICameraSaturation:        1,
+		RPICameraSharpness:         1,
+		RPICameraFPS:               30,
+		RPICameraIDRPeriod:         60,
+		RPICameraBitrate:           1000000,
+		RPICameraProfile:           "main",
+		RPICameraLevel:             "4.1",
+		RPICameraTextOverlay:       "%Y-%m-%d %H:%M:%S - MediaMTX",
 		RunOnDemandStartTimeout:    10 * StringDuration(time.Second),
 		RunOnDemandCloseAfter:      10 * StringDuration(time.Second),
 	}, pa)
@@ -171,24 +203,86 @@ func TestConfEncryption(t *testing.T) {
 	require.Equal(t, true, ok)
 }
 
-func TestConfErrorNonExistentParameter(t *testing.T) {
-	func() {
-		tmpf, err := writeTempFile([]byte(`invalid: param`))
-		require.NoError(t, err)
-		defer os.Remove(tmpf)
+func TestConfErrors(t *testing.T) {
+	for _, ca := range []struct {
+		name string
+		conf string
+		err  string
+	}{
+		{
+			"non existent parameter 1",
+			`invalid: param`,
+			"json: unknown field \"invalid\"",
+		},
+		{
+			"invalid readBufferCount",
+			"readBufferCount: 1001\n",
+			"'readBufferCount' must be a power of two",
+		},
+		{
+			"invalid udpMaxPayloadSize",
+			"udpMaxPayloadSize: 5000\n",
+			"'udpMaxPayloadSize' must be less than 1472",
+		},
+		{
+			"invalid externalAuthenticationURL 1",
+			"externalAuthenticationURL: testing\n",
+			"'externalAuthenticationURL' must be a HTTP URL",
+		},
+		{
+			"invalid externalAuthenticationURL 2",
+			"externalAuthenticationURL: http://myurl\n" +
+				"authMethods: [digest]\n",
+			"'externalAuthenticationURL' can't be used when 'digest' is in authMethods",
+		},
+		{
+			"invalid strict encryption 1",
+			"encryption: strict\n" +
+				"protocols: [udp]\n",
+			"strict encryption can't be used with the UDP transport protocol",
+		},
+		{
+			"invalid strict encryption 2",
+			"encryption: strict\n" +
+				"protocols: [multicast]\n",
+			"strict encryption can't be used with the UDP-multicast transport protocol",
+		},
+		{
+			"invalid ICE server",
+			"webrtcICEServers: [testing]\n",
+			"invalid ICE server: 'testing'",
+		},
+		{
+			"non existent parameter 2",
+			"paths:\n" +
+				"  mypath:\n" +
+				"    invalid: parameter\n",
+			"json: unknown field \"invalid\"",
+		},
+		{
+			"invalid path name",
+			"paths:\n" +
+				"  '':\n" +
+				"    source: publisher\n",
+			"invalid path name '': cannot be empty",
+		},
+		{
+			"double raspberry pi camera",
+			"paths:\n" +
+				"  cam1:\n" +
+				"    source: rpiCamera\n" +
+				"  cam2:\n" +
+				"    source: rpiCamera\n",
+			"'rpiCamera' with same camera ID 0 is used as source in two paths, 'cam1' and 'cam2'",
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			tmpf, err := writeTempFile([]byte(ca.conf))
+			require.NoError(t, err)
+			defer os.Remove(tmpf)
 
-		_, _, err = Load(tmpf)
-		require.EqualError(t, err, "non-existent parameter: 'invalid'")
-	}()
-
-	func() {
-		tmpf, err := writeTempFile([]byte("paths:\n" +
-			"  mypath:\n" +
-			"    invalid: parameter\n"))
-		require.NoError(t, err)
-		defer os.Remove(tmpf)
-
-		_, _, err = Load(tmpf)
-		require.EqualError(t, err, "parameter paths, key mypath: non-existent parameter: 'invalid'")
-	}()
+			_, _, err = Load(tmpf)
+			require.EqualError(t, err, ca.err)
+		})
+	}
 }

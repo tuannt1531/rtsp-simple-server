@@ -2,173 +2,213 @@ package core
 
 import (
 	"context"
-	"sync"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
-	"github.com/aler9/gortsplib"
+	"github.com/bluenviron/gohlslib"
+	"github.com/bluenviron/gohlslib/pkg/codecs"
+	"github.com/bluenviron/gortsplib/v3/pkg/formats"
+	"github.com/bluenviron/gortsplib/v3/pkg/media"
 
-	"github.com/aler9/rtsp-simple-server/internal/hls"
-	"github.com/aler9/rtsp-simple-server/internal/logger"
-	"github.com/aler9/rtsp-simple-server/internal/rtcpsenderset"
-)
-
-const (
-	hlsSourceRetryPause = 5 * time.Second
+	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/formatprocessor"
+	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
 type hlsSourceParent interface {
-	log(logger.Level, string, ...interface{})
-	onSourceStaticSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
-	OnSourceStaticSetNotReady(req pathSourceStaticSetNotReadyReq)
+	logger.Writer
+	sourceStaticImplSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
+	sourceStaticImplSetNotReady(req pathSourceStaticSetNotReadyReq)
 }
 
 type hlsSource struct {
-	ur          string
-	fingerprint string
-	wg          *sync.WaitGroup
-	parent      hlsSourceParent
-
-	ctx       context.Context
-	ctxCancel func()
+	parent hlsSourceParent
 }
 
 func newHLSSource(
-	parentCtx context.Context,
-	ur string,
-	fingerprint string,
-	wg *sync.WaitGroup,
-	parent hlsSourceParent) *hlsSource {
-	ctx, ctxCancel := context.WithCancel(parentCtx)
-
-	s := &hlsSource{
-		ur:          ur,
-		fingerprint: fingerprint,
-		wg:          wg,
-		parent:      parent,
-		ctx:         ctx,
-		ctxCancel:   ctxCancel,
+	parent hlsSourceParent,
+) *hlsSource {
+	return &hlsSource{
+		parent: parent,
 	}
-
-	s.Log(logger.Info, "started")
-
-	s.wg.Add(1)
-	go s.run()
-
-	return s
-}
-
-func (s *hlsSource) close() {
-	s.Log(logger.Info, "stopped")
-	s.ctxCancel()
 }
 
 func (s *hlsSource) Log(level logger.Level, format string, args ...interface{}) {
-	s.parent.log(level, "[hls source] "+format, args...)
+	s.parent.Log(level, "[hls source] "+format, args...)
 }
 
-func (s *hlsSource) run() {
-	defer s.wg.Done()
-
-outer:
-	for {
-		ok := s.runInner()
-		if !ok {
-			break outer
-		}
-
-		select {
-		case <-time.After(hlsSourceRetryPause):
-		case <-s.ctx.Done():
-			break outer
-		}
-	}
-
-	s.ctxCancel()
-}
-
-func (s *hlsSource) runInner() bool {
+// run implements sourceStaticImpl.
+func (s *hlsSource) run(ctx context.Context, cnf *conf.PathConf, reloadConf chan *conf.PathConf) error {
 	var stream *stream
-	var rtcpSenders *rtcpsenderset.RTCPSenderSet
-	var videoTrackID int
-	var audioTrackID int
 
 	defer func() {
 		if stream != nil {
-			s.parent.OnSourceStaticSetNotReady(pathSourceStaticSetNotReadyReq{Source: s})
-			rtcpSenders.Close()
+			s.parent.sourceStaticImplSetNotReady(pathSourceStaticSetNotReadyReq{})
 		}
 	}()
 
-	onTracks := func(videoTrack *gortsplib.Track, audioTrack *gortsplib.Track) error {
-		var tracks gortsplib.Tracks
+	var tlsConfig *tls.Config
+	if cnf.SourceFingerprint != "" {
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: true,
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				h := sha256.New()
+				h.Write(cs.PeerCertificates[0].Raw)
+				hstr := hex.EncodeToString(h.Sum(nil))
+				fingerprintLower := strings.ToLower(cnf.SourceFingerprint)
 
-		if videoTrack != nil {
-			videoTrackID = len(tracks)
-			tracks = append(tracks, videoTrack)
+				if hstr != fingerprintLower {
+					return fmt.Errorf("server fingerprint do not match: expected %s, got %s",
+						fingerprintLower, hstr)
+				}
+
+				return nil
+			},
+		}
+	}
+
+	c := &gohlslib.Client{
+		URI: cnf.Source,
+		HTTPClient: &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: tlsConfig,
+			},
+		},
+		Log: func(level gohlslib.LogLevel, format string, args ...interface{}) {
+			s.Log(logger.Level(level), format, args...)
+		},
+	}
+
+	c.OnTracks(func(tracks []*gohlslib.Track) error {
+		var medias media.Medias
+
+		for _, track := range tracks {
+			var medi *media.Media
+
+			switch tcodec := track.Codec.(type) {
+			case *codecs.H264:
+				medi = &media.Media{
+					Type: media.TypeVideo,
+					Formats: []formats.Format{&formats.H264{
+						PayloadTyp:        96,
+						PacketizationMode: 1,
+						SPS:               tcodec.SPS,
+						PPS:               tcodec.PPS,
+					}},
+				}
+
+				c.OnData(track, func(pts time.Duration, unit interface{}) {
+					stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitH264{
+						PTS: pts,
+						AU:  unit.([][]byte),
+						NTP: time.Now(),
+					})
+				})
+
+			case *codecs.H265:
+				medi = &media.Media{
+					Type: media.TypeVideo,
+					Formats: []formats.Format{&formats.H265{
+						PayloadTyp: 96,
+						VPS:        tcodec.VPS,
+						SPS:        tcodec.SPS,
+						PPS:        tcodec.PPS,
+					}},
+				}
+
+				c.OnData(track, func(pts time.Duration, unit interface{}) {
+					stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitH265{
+						PTS: pts,
+						AU:  unit.([][]byte),
+						NTP: time.Now(),
+					})
+				})
+
+			case *codecs.MPEG4Audio:
+				medi = &media.Media{
+					Type: media.TypeAudio,
+					Formats: []formats.Format{&formats.MPEG4Audio{
+						PayloadTyp:       96,
+						SizeLength:       13,
+						IndexLength:      3,
+						IndexDeltaLength: 3,
+						Config:           &tcodec.Config,
+					}},
+				}
+
+				c.OnData(track, func(pts time.Duration, unit interface{}) {
+					stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitMPEG4AudioGeneric{
+						PTS: pts,
+						AUs: [][]byte{unit.([]byte)},
+						NTP: time.Now(),
+					})
+				})
+
+			case *codecs.Opus:
+				medi = &media.Media{
+					Type: media.TypeAudio,
+					Formats: []formats.Format{&formats.Opus{
+						PayloadTyp: 96,
+						IsStereo:   (tcodec.Channels == 2),
+					}},
+				}
+
+				c.OnData(track, func(pts time.Duration, unit interface{}) {
+					stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitOpus{
+						PTS:   pts,
+						Frame: unit.([]byte),
+						NTP:   time.Now(),
+					})
+				})
+			}
+
+			medias = append(medias, medi)
 		}
 
-		if audioTrack != nil {
-			audioTrackID = len(tracks)
-			tracks = append(tracks, audioTrack)
-		}
-
-		res := s.parent.onSourceStaticSetReady(pathSourceStaticSetReadyReq{
-			Source: s,
-			Tracks: tracks,
+		res := s.parent.sourceStaticImplSetReady(pathSourceStaticSetReadyReq{
+			medias:             medias,
+			generateRTPPackets: true,
 		})
-		if res.Err != nil {
-			return res.Err
+		if res.err != nil {
+			return res.err
 		}
 
-		s.Log(logger.Info, "ready")
-
-		stream = res.Stream
-		rtcpSenders = rtcpsenderset.New(tracks, stream.onPacketRTCP)
+		s.Log(logger.Info, "ready: %s", sourceMediaInfo(medias))
+		stream = res.stream
 
 		return nil
-	}
+	})
 
-	onPacket := func(isVideo bool, payload []byte) {
-		var trackID int
-		if isVideo {
-			trackID = videoTrackID
-		} else {
-			trackID = audioTrackID
-		}
-
-		if stream != nil {
-			rtcpSenders.OnPacketRTP(trackID, payload)
-			stream.onPacketRTP(trackID, payload)
-		}
-	}
-
-	c, err := hls.NewClient(
-		s.ur,
-		s.fingerprint,
-		onTracks,
-		onPacket,
-		s,
-	)
+	err := c.Start()
 	if err != nil {
-		s.Log(logger.Info, "ERR: %v", err)
-		return true
+		return err
 	}
 
-	select {
-	case err := <-c.Wait():
-		s.Log(logger.Info, "ERR: %v", err)
-		return true
+	for {
+		select {
+		case err := <-c.Wait():
+			c.Close()
+			return err
 
-	case <-s.ctx.Done():
-		c.Close()
-		<-c.Wait()
-		return false
+		case <-reloadConf:
+
+		case <-ctx.Done():
+			c.Close()
+			<-c.Wait()
+			return nil
+		}
 	}
 }
 
-// onSourceAPIDescribe implements source.
-func (*hlsSource) onSourceAPIDescribe() interface{} {
-	return struct {
-		Type string `json:"type"`
-	}{"hlsSource"}
+// apiSourceDescribe implements sourceStaticImpl.
+func (*hlsSource) apiSourceDescribe() pathAPISourceOrReader {
+	return pathAPISourceOrReader{
+		Type: "hlsSource",
+		ID:   "",
+	}
 }

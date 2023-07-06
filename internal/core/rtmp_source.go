@@ -2,279 +2,212 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"fmt"
-	"sync"
+	"net"
+	"net/url"
+	"strings"
 	"time"
 
-	"github.com/aler9/gortsplib"
-	"github.com/aler9/gortsplib/pkg/h264"
-	"github.com/aler9/gortsplib/pkg/rtpaac"
-	"github.com/aler9/gortsplib/pkg/rtph264"
-	"github.com/notedit/rtmp/av"
+	"github.com/bluenviron/gortsplib/v3/pkg/formats"
+	"github.com/bluenviron/gortsplib/v3/pkg/media"
 
-	"github.com/aler9/rtsp-simple-server/internal/conf"
-	"github.com/aler9/rtsp-simple-server/internal/logger"
-	"github.com/aler9/rtsp-simple-server/internal/rtcpsenderset"
-	"github.com/aler9/rtsp-simple-server/internal/rtmp"
-)
-
-const (
-	rtmpSourceRetryPause = 5 * time.Second
+	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/rtmp"
+	"github.com/bluenviron/mediamtx/internal/rtmp/message"
 )
 
 type rtmpSourceParent interface {
-	log(logger.Level, string, ...interface{})
-	onSourceStaticSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
-	OnSourceStaticSetNotReady(req pathSourceStaticSetNotReadyReq)
+	logger.Writer
+	sourceStaticImplSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
+	sourceStaticImplSetNotReady(req pathSourceStaticSetNotReadyReq)
 }
 
 type rtmpSource struct {
-	ur           string
 	readTimeout  conf.StringDuration
 	writeTimeout conf.StringDuration
-	wg           *sync.WaitGroup
 	parent       rtmpSourceParent
-
-	ctx       context.Context
-	ctxCancel func()
 }
 
 func newRTMPSource(
-	parentCtx context.Context,
-	ur string,
 	readTimeout conf.StringDuration,
 	writeTimeout conf.StringDuration,
-	wg *sync.WaitGroup,
-	parent rtmpSourceParent) *rtmpSource {
-	ctx, ctxCancel := context.WithCancel(parentCtx)
-
-	s := &rtmpSource{
-		ur:           ur,
+	parent rtmpSourceParent,
+) *rtmpSource {
+	return &rtmpSource{
 		readTimeout:  readTimeout,
 		writeTimeout: writeTimeout,
-		wg:           wg,
 		parent:       parent,
-		ctx:          ctx,
-		ctxCancel:    ctxCancel,
+	}
+}
+
+func (s *rtmpSource) Log(level logger.Level, format string, args ...interface{}) {
+	s.parent.Log(level, "[rtmp source] "+format, args...)
+}
+
+// run implements sourceStaticImpl.
+func (s *rtmpSource) run(ctx context.Context, cnf *conf.PathConf, reloadConf chan *conf.PathConf) error {
+	s.Log(logger.Debug, "connecting")
+
+	u, err := url.Parse(cnf.Source)
+	if err != nil {
+		return err
 	}
 
-	s.log(logger.Info, "started")
-
-	s.wg.Add(1)
-	go s.run()
-
-	return s
-}
-
-// Close closes a Source.
-func (s *rtmpSource) close() {
-	s.log(logger.Info, "stopped")
-	s.ctxCancel()
-}
-
-func (s *rtmpSource) log(level logger.Level, format string, args ...interface{}) {
-	s.parent.log(level, "[rtmp source] "+format, args...)
-}
-
-func (s *rtmpSource) run() {
-	defer s.wg.Done()
-
-outer:
-	for {
-		ok := s.runInner()
-		if !ok {
-			break outer
-		}
-
-		select {
-		case <-time.After(rtmpSourceRetryPause):
-		case <-s.ctx.Done():
-			break outer
-		}
+	// add default port
+	_, _, err = net.SplitHostPort(u.Host)
+	if err != nil {
+		u.Host = net.JoinHostPort(u.Host, "1935")
 	}
 
-	s.ctxCancel()
-}
+	ctx2, cancel2 := context.WithTimeout(ctx, time.Duration(s.readTimeout))
+	defer cancel2()
 
-func (s *rtmpSource) runInner() bool {
-	innerCtx, innerCtxCancel := context.WithCancel(s.ctx)
+	nconn, err := func() (net.Conn, error) {
+		if u.Scheme == "rtmp" {
+			return (&net.Dialer{}).DialContext(ctx2, "tcp", u.Host)
+		}
 
-	runErr := make(chan error)
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: true,
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				h := sha256.New()
+				h.Write(cs.PeerCertificates[0].Raw)
+				hstr := hex.EncodeToString(h.Sum(nil))
+				fingerprintLower := strings.ToLower(cnf.SourceFingerprint)
+
+				if hstr != fingerprintLower {
+					return fmt.Errorf("server fingerprint do not match: expected %s, got %s",
+						fingerprintLower, hstr)
+				}
+
+				return nil
+			},
+		}
+
+		return (&tls.Dialer{Config: tlsConfig}).DialContext(ctx2, "tcp", u.Host)
+	}()
+	if err != nil {
+		return err
+	}
+
+	conn := rtmp.NewConn(nconn)
+
+	readDone := make(chan error)
 	go func() {
-		runErr <- func() error {
-			s.log(logger.Debug, "connecting")
-
-			ctx2, cancel2 := context.WithTimeout(innerCtx, time.Duration(s.readTimeout))
-			defer cancel2()
-
-			conn, err := rtmp.DialContext(ctx2, s.ur)
+		readDone <- func() error {
+			nconn.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
+			nconn.SetWriteDeadline(time.Now().Add(time.Duration(s.writeTimeout)))
+			err = conn.InitializeClient(u, false)
 			if err != nil {
 				return err
 			}
 
-			readDone := make(chan error)
-			go func() {
-				readDone <- func() error {
-					conn.NetConn().SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
-					conn.NetConn().SetWriteDeadline(time.Now().Add(time.Duration(s.writeTimeout)))
-					err = conn.ClientHandshake()
-					if err != nil {
-						return err
-					}
-
-					conn.NetConn().SetWriteDeadline(time.Time{})
-
-					conn.NetConn().SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
-					videoTrack, audioTrack, err := conn.ReadMetadata()
-					if err != nil {
-						return err
-					}
-
-					var tracks gortsplib.Tracks
-					videoTrackID := -1
-					audioTrackID := -1
-
-					var h264Encoder *rtph264.Encoder
-					if videoTrack != nil {
-						h264Encoder = rtph264.NewEncoder(96, nil, nil, nil)
-						videoTrackID = len(tracks)
-						tracks = append(tracks, videoTrack)
-					}
-
-					var aacEncoder *rtpaac.Encoder
-					if audioTrack != nil {
-						clockRate, _ := audioTrack.ClockRate()
-						aacEncoder = rtpaac.NewEncoder(96, clockRate, nil, nil, nil)
-						audioTrackID = len(tracks)
-						tracks = append(tracks, audioTrack)
-					}
-
-					res := s.parent.onSourceStaticSetReady(pathSourceStaticSetReadyReq{
-						Source: s,
-						Tracks: tracks,
-					})
-					if res.Err != nil {
-						return res.Err
-					}
-
-					s.log(logger.Info, "ready")
-
-					defer func() {
-						s.parent.OnSourceStaticSetNotReady(pathSourceStaticSetNotReadyReq{Source: s})
-					}()
-
-					rtcpSenders := rtcpsenderset.New(tracks, res.Stream.onPacketRTCP)
-					defer rtcpSenders.Close()
-
-					onPacketRTP := func(trackID int, payload []byte) {
-						rtcpSenders.OnPacketRTP(trackID, payload)
-						res.Stream.onPacketRTP(trackID, payload)
-					}
-
-					for {
-						conn.NetConn().SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
-						pkt, err := conn.ReadPacket()
-						if err != nil {
-							return err
-						}
-
-						switch pkt.Type {
-						case av.H264:
-							if videoTrack == nil {
-								return fmt.Errorf("received an H264 packet, but track is not set up")
-							}
-
-							nalus, err := h264.DecodeAVCC(pkt.Data)
-							if err != nil {
-								return err
-							}
-
-							var outNALUs [][]byte
-							for _, nalu := range nalus {
-								// remove SPS, PPS and AUD, not needed by RTSP / RTMP
-								typ := h264.NALUType(nalu[0] & 0x1F)
-								switch typ {
-								case h264.NALUTypeSPS, h264.NALUTypePPS, h264.NALUTypeAccessUnitDelimiter:
-									continue
-								}
-
-								outNALUs = append(outNALUs, nalu)
-							}
-
-							pkts, err := h264Encoder.Encode(outNALUs, pkt.Time+pkt.CTime)
-							if err != nil {
-								return fmt.Errorf("error while encoding H264: %v", err)
-							}
-
-							bytss := make([][]byte, len(pkts))
-							for i, pkt := range pkts {
-								byts, err := pkt.Marshal()
-								if err != nil {
-									return fmt.Errorf("error while encoding H264: %v", err)
-								}
-								bytss[i] = byts
-							}
-
-							for _, byts := range bytss {
-								onPacketRTP(videoTrackID, byts)
-							}
-
-						case av.AAC:
-							if audioTrack == nil {
-								return fmt.Errorf("received an AAC packet, but track is not set up")
-							}
-
-							pkts, err := aacEncoder.Encode([][]byte{pkt.Data}, pkt.Time+pkt.CTime)
-							if err != nil {
-								return fmt.Errorf("error while encoding AAC: %v", err)
-							}
-
-							bytss := make([][]byte, len(pkts))
-							for i, pkt := range pkts {
-								byts, err := pkt.Marshal()
-								if err != nil {
-									return fmt.Errorf("error while encoding AAC: %v", err)
-								}
-								bytss[i] = byts
-							}
-
-							for _, byts := range bytss {
-								onPacketRTP(audioTrackID, byts)
-							}
-						}
-					}
-				}()
-			}()
-
-			select {
-			case err := <-readDone:
-				conn.NetConn().Close()
+			nconn.SetWriteDeadline(time.Time{})
+			nconn.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
+			videoFormat, audioFormat, err := conn.ReadTracks()
+			if err != nil {
 				return err
+			}
 
-			case <-innerCtx.Done():
-				conn.NetConn().Close()
-				<-readDone
-				return nil
+			switch videoFormat.(type) {
+			case *formats.H265, *formats.AV1:
+				return fmt.Errorf("proxying H265 or AV1 tracks with RTMP is not supported")
+			}
+
+			var medias media.Medias
+			var videoMedia *media.Media
+			var audioMedia *media.Media
+
+			if videoFormat != nil {
+				videoMedia = &media.Media{
+					Type:    media.TypeVideo,
+					Formats: []formats.Format{videoFormat},
+				}
+				medias = append(medias, videoMedia)
+			}
+
+			if audioFormat != nil {
+				audioMedia = &media.Media{
+					Type:    media.TypeAudio,
+					Formats: []formats.Format{audioFormat},
+				}
+				medias = append(medias, audioMedia)
+			}
+
+			res := s.parent.sourceStaticImplSetReady(pathSourceStaticSetReadyReq{
+				medias:             medias,
+				generateRTPPackets: true,
+			})
+			if res.err != nil {
+				return res.err
+			}
+
+			s.Log(logger.Info, "ready: %s", sourceMediaInfo(medias))
+
+			defer s.parent.sourceStaticImplSetNotReady(pathSourceStaticSetNotReadyReq{})
+
+			videoWriteFunc := getRTMPWriteFunc(videoMedia, videoFormat, res.stream)
+			audioWriteFunc := getRTMPWriteFunc(audioMedia, audioFormat, res.stream)
+
+			// disable write deadline to allow outgoing acknowledges
+			nconn.SetWriteDeadline(time.Time{})
+
+			for {
+				nconn.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
+				msg, err := conn.ReadMessage()
+				if err != nil {
+					return err
+				}
+
+				switch tmsg := msg.(type) {
+				case *message.Video:
+					if videoFormat == nil {
+						return fmt.Errorf("received an H264 packet, but track is not set up")
+					}
+
+					err := videoWriteFunc(tmsg)
+					if err != nil {
+						s.Log(logger.Warn, "%v", err)
+					}
+
+				case *message.Audio:
+					if audioFormat == nil {
+						return fmt.Errorf("received an AAC packet, but track is not set up")
+					}
+
+					err := audioWriteFunc(tmsg)
+					if err != nil {
+						s.Log(logger.Warn, "%v", err)
+					}
+				}
 			}
 		}()
 	}()
 
-	select {
-	case err := <-runErr:
-		innerCtxCancel()
-		s.log(logger.Info, "ERR: %s", err)
-		return true
+	for {
+		select {
+		case err := <-readDone:
+			nconn.Close()
+			return err
 
-	case <-s.ctx.Done():
-		innerCtxCancel()
-		<-runErr
-		return false
+		case <-reloadConf:
+
+		case <-ctx.Done():
+			nconn.Close()
+			<-readDone
+			return nil
+		}
 	}
 }
 
-// onSourceAPIDescribe implements source.
-func (*rtmpSource) onSourceAPIDescribe() interface{} {
-	return struct {
-		Type string `json:"type"`
-	}{"rtmpSource"}
+// apiSourceDescribe implements sourceStaticImpl.
+func (*rtmpSource) apiSourceDescribe() pathAPISourceOrReader {
+	return pathAPISourceOrReader{
+		Type: "rtmpSource",
+		ID:   "",
+	}
 }

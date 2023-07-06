@@ -1,26 +1,28 @@
 package core
 
 import (
-	"context"
 	"encoding/json"
-	"net"
+	"errors"
 	"net/http"
-	"net/http/httputil"
 	"reflect"
+	"strconv"
 	"sync"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
-	"github.com/aler9/rtsp-simple-server/internal/conf"
-	"github.com/aler9/rtsp-simple-server/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/logger"
 )
+
+var errAPINotFound = errors.New("not found")
 
 func interfaceIsEmpty(i interface{}) bool {
 	return reflect.ValueOf(i).Kind() != reflect.Ptr || reflect.ValueOf(i).IsNil()
 }
 
 func fillStruct(dest interface{}, source interface{}) {
-	rvsource := reflect.ValueOf(source)
+	rvsource := reflect.ValueOf(source).Elem()
 	rvdest := reflect.ValueOf(dest)
 	nf := rvsource.NumField()
 	for i := 0; i < nf; i++ {
@@ -36,58 +38,30 @@ func fillStruct(dest interface{}, source interface{}) {
 	}
 }
 
-func cloneStruct(dest interface{}, source interface{}) {
-	enc, _ := json.Marshal(source)
-	_ = json.Unmarshal(enc, dest)
+func generateStructWithOptionalFields(model interface{}) interface{} {
+	var fields []reflect.StructField
+
+	rt := reflect.TypeOf(model)
+	nf := rt.NumField()
+	for i := 0; i < nf; i++ {
+		f := rt.Field(i)
+		j := f.Tag.Get("json")
+
+		if j != "-" && j != "paths" {
+			fields = append(fields, reflect.StructField{
+				Name: f.Name,
+				Type: reflect.PtrTo(f.Type),
+				Tag:  f.Tag,
+			})
+		}
+	}
+
+	return reflect.New(reflect.StructOf(fields)).Interface()
 }
 
 func loadConfData(ctx *gin.Context) (interface{}, error) {
-	var in struct {
-		// general
-		LogLevel            *conf.LogLevel        `json:"logLevel"`
-		LogDestinations     *conf.LogDestinations `json:"logDestinations"`
-		LogFile             *string               `json:"logFile"`
-		ReadTimeout         *conf.StringDuration  `json:"readTimeout"`
-		WriteTimeout        *conf.StringDuration  `json:"writeTimeout"`
-		ReadBufferCount     *int                  `json:"readBufferCount"`
-		API                 *bool                 `json:"api"`
-		APIAddress          *string               `json:"apiAddress"`
-		Metrics             *bool                 `json:"metrics"`
-		MetricsAddress      *string               `json:"metricsAddress"`
-		PPROF               *bool                 `json:"pprof"`
-		PPROFAddress        *string               `json:"pprofAddress"`
-		RunOnConnect        *string               `json:"runOnConnect"`
-		RunOnConnectRestart *bool                 `json:"runOnConnectRestart"`
-
-		// RTSP
-		RTSPDisable       *bool             `json:"rtspDisable"`
-		Protocols         *conf.Protocols   `json:"protocols"`
-		Encryption        *conf.Encryption  `json:"encryption"`
-		RTSPAddress       *string           `json:"rtspAddress"`
-		RTSPSAddress      *string           `json:"rtspsAddress"`
-		RTPAddress        *string           `json:"rtpAddress"`
-		RTCPAddress       *string           `json:"rtcpAddress"`
-		MulticastIPRange  *string           `json:"multicastIPRange"`
-		MulticastRTPPort  *int              `json:"multicastRTPPort"`
-		MulticastRTCPPort *int              `json:"multicastRTCPPort"`
-		ServerKey         *string           `json:"serverKey"`
-		ServerCert        *string           `json:"serverCert"`
-		AuthMethods       *conf.AuthMethods `json:"authMethods"`
-		ReadBufferSize    *int              `json:"readBufferSize"`
-
-		// RTMP
-		RTMPDisable *bool   `json:"rtmpDisable"`
-		RTMPAddress *string `json:"rtmpAddress"`
-
-		// HLS
-		HLSDisable         *bool                `json:"hlsDisable"`
-		HLSAddress         *string              `json:"hlsAddress"`
-		HLSAlwaysRemux     *bool                `json:"hlsAlwaysRemux"`
-		HLSSegmentCount    *int                 `json:"hlsSegmentCount"`
-		HLSSegmentDuration *conf.StringDuration `json:"hlsSegmentDuration"`
-		HLSAllowOrigin     *string              `json:"hlsAllowOrigin"`
-	}
-	err := json.NewDecoder(ctx.Request.Body).Decode(&in)
+	in := generateStructWithOptionalFields(conf.Conf{})
+	err := json.NewDecoder(ctx.Request.Body).Decode(in)
 	if err != nil {
 		return nil, err
 	}
@@ -96,40 +70,8 @@ func loadConfData(ctx *gin.Context) (interface{}, error) {
 }
 
 func loadConfPathData(ctx *gin.Context) (interface{}, error) {
-	var in struct {
-		// source
-		Source                     *string              `json:"source"`
-		SourceProtocol             *conf.SourceProtocol `json:"sourceProtocol"`
-		SourceAnyPortEnable        *bool                `json:"sourceAnyPortEnable"`
-		SourceFingerprint          *string              `json:"sourceFingerprint"`
-		SourceOnDemand             *bool                `json:"sourceOnDemand"`
-		SourceOnDemandStartTimeout *conf.StringDuration `json:"sourceOnDemandStartTimeout"`
-		SourceOnDemandCloseAfter   *conf.StringDuration `json:"sourceOnDemandCloseAfter"`
-		SourceRedirect             *string              `json:"sourceRedirect"`
-		DisablePublisherOverride   *bool                `json:"disablePublisherOverride"`
-		Fallback                   *string              `json:"fallback"`
-
-		// authentication
-		PublishUser *conf.Credential `json:"publishUser"`
-		PublishPass *conf.Credential `json:"publishPass"`
-		PublishIPs  *conf.IPsOrNets  `json:"publishIPs"`
-		ReadUser    *conf.Credential `json:"readUser"`
-		ReadPass    *conf.Credential `json:"readPass"`
-		ReadIPs     *conf.IPsOrNets  `json:"readIPs"`
-
-		// custom commands
-		RunOnInit               *string              `json:"runOnInit"`
-		RunOnInitRestart        *bool                `json:"runOnInitRestart"`
-		RunOnDemand             *string              `json:"runOnDemand"`
-		RunOnDemandRestart      *bool                `json:"runOnDemandRestart"`
-		RunOnDemandStartTimeout *conf.StringDuration `json:"runOnDemandStartTimeout"`
-		RunOnDemandCloseAfter   *conf.StringDuration `json:"runOnDemandCloseAfter"`
-		RunOnPublish            *string              `json:"runOnPublish"`
-		RunOnPublishRestart     *bool                `json:"runOnPublishRestart"`
-		RunOnRead               *string              `json:"runOnRead"`
-		RunOnReadRestart        *bool                `json:"runOnReadRestart"`
-	}
-	err := json.NewDecoder(ctx.Request.Body).Decode(&in)
+	in := generateStructWithOptionalFields(conf.PathConf{})
+	err := json.NewDecoder(ctx.Request.Body).Decode(in)
 	if err != nil {
 		return nil, err
 	}
@@ -137,130 +79,220 @@ func loadConfPathData(ctx *gin.Context) (interface{}, error) {
 	return in, err
 }
 
+func paginate2(itemsPtr interface{}, itemsPerPage int, page int) int {
+	ritems := reflect.ValueOf(itemsPtr).Elem()
+
+	itemsLen := ritems.Len()
+	if itemsLen == 0 {
+		return 0
+	}
+
+	pageCount := (itemsLen / itemsPerPage)
+	if (itemsLen % itemsPerPage) != 0 {
+		pageCount++
+	}
+
+	min := page * itemsPerPage
+	if min >= itemsLen {
+		min = itemsLen - 1
+	}
+
+	max := (page + 1) * itemsPerPage
+	if max >= itemsLen {
+		max = itemsLen
+	}
+
+	ritems.Set(ritems.Slice(min, max))
+
+	return pageCount
+}
+
+func paginate(itemsPtr interface{}, itemsPerPageStr string, pageStr string) (int, error) {
+	itemsPerPage := 100
+
+	if itemsPerPageStr != "" {
+		tmp, err := strconv.ParseUint(itemsPerPageStr, 10, 31)
+		if err != nil {
+			return 0, err
+		}
+		itemsPerPage = int(tmp)
+	}
+
+	page := 0
+
+	if pageStr != "" {
+		tmp, err := strconv.ParseUint(pageStr, 10, 31)
+		if err != nil {
+			return 0, err
+		}
+		page = int(tmp)
+	}
+
+	return paginate2(itemsPtr, itemsPerPage, page), nil
+}
+
+func abortWithError(ctx *gin.Context, err error) {
+	if err == errAPINotFound {
+		ctx.AbortWithStatus(http.StatusNotFound)
+	} else {
+		ctx.AbortWithStatus(http.StatusInternalServerError)
+	}
+}
+
 type apiPathManager interface {
-	onAPIPathsList(req pathAPIPathsListReq) pathAPIPathsListRes
+	apiPathsList() (*apiPathsList, error)
+	apiPathsGet(string) (*apiPath, error)
+}
+
+type apiHLSManager interface {
+	apiMuxersList() (*apiHLSMuxersList, error)
+	apiMuxersGet(string) (*apiHLSMuxer, error)
 }
 
 type apiRTSPServer interface {
-	onAPISessionsList(req rtspServerAPISessionsListReq) rtspServerAPISessionsListRes
-	onAPISessionsKick(req rtspServerAPISessionsKickReq) rtspServerAPISessionsKickRes
+	apiConnsList() (*apiRTSPConnsList, error)
+	apiConnsGet(uuid.UUID) (*apiRTSPConn, error)
+	apiSessionsList() (*apiRTSPSessionsList, error)
+	apiSessionsGet(uuid.UUID) (*apiRTSPSession, error)
+	apiSessionsKick(uuid.UUID) error
 }
 
 type apiRTMPServer interface {
-	onAPIConnsList(req rtmpServerAPIConnsListReq) rtmpServerAPIConnsListRes
-	onAPIConnsKick(req rtmpServerAPIConnsKickReq) rtmpServerAPIConnsKickRes
+	apiConnsList() (*apiRTMPConnsList, error)
+	apiConnsGet(uuid.UUID) (*apiRTMPConn, error)
+	apiConnsKick(uuid.UUID) error
 }
 
-type apiHLSServer interface {
-	onAPIHLSMuxersList(req hlsServerAPIMuxersListReq) hlsServerAPIMuxersListRes
+type apiWebRTCManager interface {
+	apiSessionsList() (*apiWebRTCSessionsList, error)
+	apiSessionsGet(uuid.UUID) (*apiWebRTCSession, error)
+	apiSessionsKick(uuid.UUID) error
 }
 
 type apiParent interface {
-	Log(logger.Level, string, ...interface{})
-	onAPIConfigSet(conf *conf.Conf)
+	logger.Writer
+	apiConfigSet(conf *conf.Conf)
 }
 
 type api struct {
-	conf        *conf.Conf
-	pathManager apiPathManager
-	rtspServer  apiRTSPServer
-	rtspsServer apiRTSPServer
-	rtmpServer  apiRTMPServer
-	hlsServer   apiHLSServer
-	parent      apiParent
+	conf          *conf.Conf
+	pathManager   apiPathManager
+	rtspServer    apiRTSPServer
+	rtspsServer   apiRTSPServer
+	rtmpServer    apiRTMPServer
+	rtmpsServer   apiRTMPServer
+	hlsManager    apiHLSManager
+	webRTCManager apiWebRTCManager
+	parent        apiParent
 
-	mutex sync.Mutex
-	s     *http.Server
+	httpServer *httpServer
+	mutex      sync.Mutex
 }
 
 func newAPI(
 	address string,
+	readTimeout conf.StringDuration,
 	conf *conf.Conf,
 	pathManager apiPathManager,
 	rtspServer apiRTSPServer,
 	rtspsServer apiRTSPServer,
 	rtmpServer apiRTMPServer,
-	hlsServer apiHLSServer,
+	rtmpsServer apiRTMPServer,
+	hlsManager apiHLSManager,
+	webRTCManager apiWebRTCManager,
 	parent apiParent,
 ) (*api, error) {
-	ln, err := net.Listen("tcp", address)
+	a := &api{
+		conf:          conf,
+		pathManager:   pathManager,
+		rtspServer:    rtspServer,
+		rtspsServer:   rtspsServer,
+		rtmpServer:    rtmpServer,
+		rtmpsServer:   rtmpsServer,
+		hlsManager:    hlsManager,
+		webRTCManager: webRTCManager,
+		parent:        parent,
+	}
+
+	router := gin.New()
+	router.SetTrustedProxies(nil)
+
+	mwLog := httpLoggerMiddleware(a)
+	router.NoRoute(mwLog, httpServerHeaderMiddleware)
+	group := router.Group("/", mwLog, httpServerHeaderMiddleware)
+
+	group.GET("/v2/config/get", a.onConfigGet)
+	group.POST("/v2/config/set", a.onConfigSet)
+	group.POST("/v2/config/paths/add/*name", a.onConfigPathsAdd)
+	group.POST("/v2/config/paths/edit/*name", a.onConfigPathsEdit)
+	group.POST("/v2/config/paths/remove/*name", a.onConfigPathsDelete)
+
+	if !interfaceIsEmpty(a.hlsManager) {
+		group.GET("/v2/hlsmuxers/list", a.onHLSMuxersList)
+		group.GET("/v2/hlsmuxers/get/:name", a.onHLSMuxersGet)
+	}
+
+	group.GET("/v2/paths/list", a.onPathsList)
+	group.GET("/v2/paths/get/:name", a.onPathsGet)
+
+	if !interfaceIsEmpty(a.rtspServer) {
+		group.GET("/v2/rtspconns/list", a.onRTSPConnsList)
+		group.GET("/v2/rtspconns/get/:id", a.onRTSPConnsGet)
+		group.GET("/v2/rtspsessions/list", a.onRTSPSessionsList)
+		group.GET("/v2/rtspsessions/get/:id", a.onRTSPSessionsGet)
+		group.POST("/v2/rtspsessions/kick/:id", a.onRTSPSessionsKick)
+	}
+
+	if !interfaceIsEmpty(a.rtspsServer) {
+		group.GET("/v2/rtspsconns/list", a.onRTSPSConnsList)
+		group.GET("/v2/rtspsconns/get/:id", a.onRTSPSConnsGet)
+		group.GET("/v2/rtspssessions/list", a.onRTSPSSessionsList)
+		group.GET("/v2/rtspssessions/get/:id", a.onRTSPSSessionsGet)
+		group.POST("/v2/rtspssessions/kick/:id", a.onRTSPSSessionsKick)
+	}
+
+	if !interfaceIsEmpty(a.rtmpServer) {
+		group.GET("/v2/rtmpconns/list", a.onRTMPConnsList)
+		group.GET("/v2/rtmpconns/get/:id", a.onRTMPConnsGet)
+		group.POST("/v2/rtmpconns/kick/:id", a.onRTMPConnsKick)
+	}
+
+	if !interfaceIsEmpty(a.rtmpsServer) {
+		group.GET("/v2/rtmpsconns/list", a.onRTMPSConnsList)
+		group.GET("/v2/rtmpsconns/get/:id", a.onRTMPSConnsGet)
+		group.POST("/v2/rtmpsconns/kick/:id", a.onRTMPSConnsKick)
+	}
+
+	if !interfaceIsEmpty(a.webRTCManager) {
+		group.GET("/v2/webrtcsessions/list", a.onWebRTCSessionsList)
+		group.GET("/v2/webrtcsessions/get/:id", a.onWebRTCSessionsGet)
+		group.POST("/v2/webrtcsessions/kick/:id", a.onWebRTCSessionsKick)
+	}
+
+	var err error
+	a.httpServer, err = newHTTPServer(
+		address,
+		readTimeout,
+		"",
+		"",
+		router,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	a := &api{
-		conf:        conf,
-		pathManager: pathManager,
-		rtspServer:  rtspServer,
-		rtspsServer: rtspsServer,
-		rtmpServer:  rtmpServer,
-		hlsServer:   hlsServer,
-		parent:      parent,
-	}
-
-	router := gin.New()
-	router.NoRoute(a.mwLog)
-	group := router.Group("/", a.mwLog)
-
-	group.GET("/v1/config/get", a.onConfigGet)
-	group.POST("/v1/config/set", a.onConfigSet)
-	group.POST("/v1/config/paths/add/*name", a.onConfigPathsAdd)
-	group.POST("/v1/config/paths/edit/*name", a.onConfigPathsEdit)
-	group.POST("/v1/config/paths/remove/*name", a.onConfigPathsDelete)
-
-	group.GET("/v1/paths/list", a.onPathsList)
-
-	if !interfaceIsEmpty(a.rtspServer) {
-		group.GET("/v1/rtspsessions/list", a.onRTSPSessionsList)
-		group.POST("/v1/rtspsessions/kick/:id", a.onRTSPSessionsKick)
-	}
-
-	if !interfaceIsEmpty(a.rtspsServer) {
-		group.GET("/v1/rtspssessions/list", a.onRTSPSSessionsList)
-		group.POST("/v1/rtspssessions/kick/:id", a.onRTSPSSessionsKick)
-	}
-
-	if !interfaceIsEmpty(a.rtmpServer) {
-		group.GET("/v1/rtmpconns/list", a.onRTMPConnsList)
-		group.POST("/v1/rtmpconns/kick/:id", a.onRTMPConnsKick)
-	}
-
-	if !interfaceIsEmpty(a.hlsServer) {
-		group.GET("/v1/hlsmuxers/list", a.onHLSMuxersList)
-	}
-
-	a.s = &http.Server{Handler: router}
-
-	go a.s.Serve(ln)
-
-	a.log(logger.Info, "listener opened on "+address)
+	a.Log(logger.Info, "listener opened on "+address)
 
 	return a, nil
 }
 
 func (a *api) close() {
-	a.s.Shutdown(context.Background())
-	a.log(logger.Info, "listener closed")
+	a.Log(logger.Info, "listener is closing")
+	a.httpServer.close()
 }
 
-func (a *api) log(level logger.Level, format string, args ...interface{}) {
+func (a *api) Log(level logger.Level, format string, args ...interface{}) {
 	a.parent.Log(level, "[API] "+format, args...)
-}
-
-func (a *api) mwLog(ctx *gin.Context) {
-	a.log(logger.Info, "[conn %v] %s %s", ctx.Request.RemoteAddr, ctx.Request.Method, ctx.Request.URL.Path)
-
-	byts, _ := httputil.DumpRequest(ctx.Request, true)
-	a.log(logger.Debug, "[conn %v] [c->s] %s", ctx.Request.RemoteAddr, string(byts))
-
-	logw := &httpLogWriter{ResponseWriter: ctx.Writer}
-	ctx.Writer = logw
-
-	ctx.Writer.Header().Set("Server", "rtsp-simple-server")
-
-	ctx.Next()
-
-	a.log(logger.Debug, "[conn %v] [s->c] %s", ctx.Request.RemoteAddr, logw.dump())
 }
 
 func (a *api) onConfigGet(ctx *gin.Context) {
@@ -281,21 +313,21 @@ func (a *api) onConfigSet(ctx *gin.Context) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	var newConf conf.Conf
-	cloneStruct(&newConf, a.conf)
-	fillStruct(&newConf, in)
+	newConf := a.conf.Clone()
 
-	err = newConf.CheckAndFillMissing()
+	fillStruct(newConf, in)
+
+	err = newConf.Check()
 	if err != nil {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
-	a.conf = &newConf
+	a.conf = newConf
 
 	// since reloading the configuration can cause the shutdown of the API,
 	// call it in a goroutine
-	go a.parent.onAPIConfigSet(&newConf)
+	go a.parent.apiConfigSet(newConf)
 
 	ctx.Status(http.StatusOK)
 }
@@ -317,8 +349,7 @@ func (a *api) onConfigPathsAdd(ctx *gin.Context) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	var newConf conf.Conf
-	cloneStruct(&newConf, a.conf)
+	newConf := a.conf.Clone()
 
 	if _, ok := newConf.Paths[name]; ok {
 		ctx.AbortWithStatus(http.StatusBadRequest)
@@ -326,21 +357,25 @@ func (a *api) onConfigPathsAdd(ctx *gin.Context) {
 	}
 
 	newConfPath := &conf.PathConf{}
+
+	// load default values
+	newConfPath.UnmarshalJSON([]byte("{}"))
+
 	fillStruct(newConfPath, in)
 
 	newConf.Paths[name] = newConfPath
 
-	err = newConf.CheckAndFillMissing()
+	err = newConf.Check()
 	if err != nil {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
-	a.conf = &newConf
+	a.conf = newConf
 
 	// since reloading the configuration can cause the shutdown of the API,
 	// call it in a goroutine
-	go a.parent.onAPIConfigSet(&newConf)
+	go a.parent.apiConfigSet(newConf)
 
 	ctx.Status(http.StatusOK)
 }
@@ -362,8 +397,7 @@ func (a *api) onConfigPathsEdit(ctx *gin.Context) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	var newConf conf.Conf
-	cloneStruct(&newConf, a.conf)
+	newConf := a.conf.Clone()
 
 	newConfPath, ok := newConf.Paths[name]
 	if !ok {
@@ -373,17 +407,17 @@ func (a *api) onConfigPathsEdit(ctx *gin.Context) {
 
 	fillStruct(newConfPath, in)
 
-	err = newConf.CheckAndFillMissing()
+	err = newConf.Check()
 	if err != nil {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
-	a.conf = &newConf
+	a.conf = newConf
 
 	// since reloading the configuration can cause the shutdown of the API,
 	// call it in a goroutine
-	go a.parent.onAPIConfigSet(&newConf)
+	go a.parent.apiConfigSet(newConf)
 
 	ctx.Status(http.StatusOK)
 }
@@ -399,79 +433,219 @@ func (a *api) onConfigPathsDelete(ctx *gin.Context) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	var newConf conf.Conf
-	cloneStruct(&newConf, a.conf)
-
-	if _, ok := newConf.Paths[name]; !ok {
-		ctx.AbortWithStatus(http.StatusBadRequest)
+	if _, ok := a.conf.Paths[name]; !ok {
+		ctx.AbortWithStatus(http.StatusNotFound)
 		return
 	}
 
+	newConf := a.conf.Clone()
 	delete(newConf.Paths, name)
 
-	err := newConf.CheckAndFillMissing()
+	err := newConf.Check()
 	if err != nil {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
-	a.conf = &newConf
+	a.conf = newConf
 
 	// since reloading the configuration can cause the shutdown of the API,
 	// call it in a goroutine
-	go a.parent.onAPIConfigSet(&newConf)
+	go a.parent.apiConfigSet(newConf)
 
 	ctx.Status(http.StatusOK)
 }
 
 func (a *api) onPathsList(ctx *gin.Context) {
-	res := a.pathManager.onAPIPathsList(pathAPIPathsListReq{})
-	if res.Err != nil {
+	data, err := a.pathManager.apiPathsList()
+	if err != nil {
 		ctx.AbortWithStatus(http.StatusInternalServerError)
 		return
 	}
 
-	ctx.JSON(http.StatusOK, res.Data)
+	data.ItemCount = len(data.Items)
+	pageCount, err := paginate(&data.Items, ctx.Query("itemsPerPage"), ctx.Query("page"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	data.PageCount = pageCount
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onPathsGet(ctx *gin.Context) {
+	data, err := a.pathManager.apiPathsGet(ctx.Param("name"))
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onRTSPConnsList(ctx *gin.Context) {
+	data, err := a.rtspServer.apiConnsList()
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	data.ItemCount = len(data.Items)
+	pageCount, err := paginate(&data.Items, ctx.Query("itemsPerPage"), ctx.Query("page"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	data.PageCount = pageCount
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onRTSPConnsGet(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	data, err := a.rtspServer.apiConnsGet(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, data)
 }
 
 func (a *api) onRTSPSessionsList(ctx *gin.Context) {
-	res := a.rtspServer.onAPISessionsList(rtspServerAPISessionsListReq{})
-	if res.Err != nil {
+	data, err := a.rtspServer.apiSessionsList()
+	if err != nil {
 		ctx.AbortWithStatus(http.StatusInternalServerError)
 		return
 	}
 
-	ctx.JSON(http.StatusOK, res.Data)
+	data.ItemCount = len(data.Items)
+	pageCount, err := paginate(&data.Items, ctx.Query("itemsPerPage"), ctx.Query("page"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	data.PageCount = pageCount
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onRTSPSessionsGet(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	data, err := a.rtspServer.apiSessionsGet(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, data)
 }
 
 func (a *api) onRTSPSessionsKick(ctx *gin.Context) {
-	id := ctx.Param("id")
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
 
-	res := a.rtspServer.onAPISessionsKick(rtspServerAPISessionsKickReq{ID: id})
-	if res.Err != nil {
-		ctx.AbortWithStatus(http.StatusNotFound)
+	err = a.rtspServer.apiSessionsKick(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
 		return
 	}
 
 	ctx.Status(http.StatusOK)
 }
 
-func (a *api) onRTSPSSessionsList(ctx *gin.Context) {
-	res := a.rtspsServer.onAPISessionsList(rtspServerAPISessionsListReq{})
-	if res.Err != nil {
+func (a *api) onRTSPSConnsList(ctx *gin.Context) {
+	data, err := a.rtspsServer.apiConnsList()
+	if err != nil {
 		ctx.AbortWithStatus(http.StatusInternalServerError)
 		return
 	}
 
-	ctx.JSON(http.StatusOK, res.Data)
+	data.ItemCount = len(data.Items)
+	pageCount, err := paginate(&data.Items, ctx.Query("itemsPerPage"), ctx.Query("page"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	data.PageCount = pageCount
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onRTSPSConnsGet(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	data, err := a.rtspsServer.apiConnsGet(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onRTSPSSessionsList(ctx *gin.Context) {
+	data, err := a.rtspsServer.apiSessionsList()
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	data.ItemCount = len(data.Items)
+	pageCount, err := paginate(&data.Items, ctx.Query("itemsPerPage"), ctx.Query("page"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	data.PageCount = pageCount
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onRTSPSSessionsGet(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	data, err := a.rtspsServer.apiSessionsGet(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, data)
 }
 
 func (a *api) onRTSPSSessionsKick(ctx *gin.Context) {
-	id := ctx.Param("id")
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
 
-	res := a.rtspsServer.onAPISessionsKick(rtspServerAPISessionsKickReq{ID: id})
-	if res.Err != nil {
-		ctx.AbortWithStatus(http.StatusNotFound)
+	err = a.rtspsServer.apiSessionsKick(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
 		return
 	}
 
@@ -479,21 +653,99 @@ func (a *api) onRTSPSSessionsKick(ctx *gin.Context) {
 }
 
 func (a *api) onRTMPConnsList(ctx *gin.Context) {
-	res := a.rtmpServer.onAPIConnsList(rtmpServerAPIConnsListReq{})
-	if res.Err != nil {
+	data, err := a.rtmpServer.apiConnsList()
+	if err != nil {
 		ctx.AbortWithStatus(http.StatusInternalServerError)
 		return
 	}
 
-	ctx.JSON(http.StatusOK, res.Data)
+	data.ItemCount = len(data.Items)
+	pageCount, err := paginate(&data.Items, ctx.Query("itemsPerPage"), ctx.Query("page"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	data.PageCount = pageCount
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onRTMPConnsGet(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	data, err := a.rtmpServer.apiConnsGet(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, data)
 }
 
 func (a *api) onRTMPConnsKick(ctx *gin.Context) {
-	id := ctx.Param("id")
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
 
-	res := a.rtmpServer.onAPIConnsKick(rtmpServerAPIConnsKickReq{ID: id})
-	if res.Err != nil {
-		ctx.AbortWithStatus(http.StatusNotFound)
+	err = a.rtmpServer.apiConnsKick(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.Status(http.StatusOK)
+}
+
+func (a *api) onRTMPSConnsList(ctx *gin.Context) {
+	data, err := a.rtmpsServer.apiConnsList()
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	data.ItemCount = len(data.Items)
+	pageCount, err := paginate(&data.Items, ctx.Query("itemsPerPage"), ctx.Query("page"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	data.PageCount = pageCount
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onRTMPSConnsGet(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	data, err := a.rtmpsServer.apiConnsGet(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onRTMPSConnsKick(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	err = a.rtmpsServer.apiConnsKick(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
 		return
 	}
 
@@ -501,17 +753,85 @@ func (a *api) onRTMPConnsKick(ctx *gin.Context) {
 }
 
 func (a *api) onHLSMuxersList(ctx *gin.Context) {
-	res := a.hlsServer.onAPIHLSMuxersList(hlsServerAPIMuxersListReq{})
-	if res.Err != nil {
+	data, err := a.hlsManager.apiMuxersList()
+	if err != nil {
 		ctx.AbortWithStatus(http.StatusInternalServerError)
 		return
 	}
 
-	ctx.JSON(http.StatusOK, res.Data)
+	data.ItemCount = len(data.Items)
+	pageCount, err := paginate(&data.Items, ctx.Query("itemsPerPage"), ctx.Query("page"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	data.PageCount = pageCount
+
+	ctx.JSON(http.StatusOK, data)
 }
 
-// onConfReload is called by core.
-func (a *api) onConfReload(conf *conf.Conf) {
+func (a *api) onHLSMuxersGet(ctx *gin.Context) {
+	data, err := a.hlsManager.apiMuxersGet(ctx.Param("name"))
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onWebRTCSessionsList(ctx *gin.Context) {
+	data, err := a.webRTCManager.apiSessionsList()
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	data.ItemCount = len(data.Items)
+	pageCount, err := paginate(&data.Items, ctx.Query("itemsPerPage"), ctx.Query("page"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	data.PageCount = pageCount
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onWebRTCSessionsGet(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	data, err := a.webRTCManager.apiSessionsGet(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onWebRTCSessionsKick(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	err = a.webRTCManager.apiSessionsKick(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.Status(http.StatusOK)
+}
+
+// confReload is called by core.
+func (a *api) confReload(conf *conf.Conf) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 	a.conf = conf

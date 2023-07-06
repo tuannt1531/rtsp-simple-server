@@ -1,3 +1,4 @@
+// Package confwatcher contains a configuration watcher.
 package confwatcher
 
 import (
@@ -18,6 +19,9 @@ type ConfWatcher struct {
 	inner       *fsnotify.Watcher
 	watchedPath string
 
+	// in
+	terminate chan struct{}
+
 	// out
 	signal chan struct{}
 	done   chan struct{}
@@ -26,7 +30,14 @@ type ConfWatcher struct {
 // New allocates a ConfWatcher.
 func New(confPath string) (*ConfWatcher, error) {
 	if _, err := os.Stat(confPath); err != nil {
-		return nil, err
+		if confPath == "mediamtx.yml" {
+			confPath = "rtsp-simple-server.yml"
+			if _, err := os.Stat(confPath); err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 
 	inner, err := fsnotify.NewWatcher()
@@ -47,6 +58,7 @@ func New(confPath string) (*ConfWatcher, error) {
 	w := &ConfWatcher{
 		inner:       inner,
 		watchedPath: absolutePath,
+		terminate:   make(chan struct{}),
 		signal:      make(chan struct{}),
 		done:        make(chan struct{}),
 	}
@@ -58,11 +70,7 @@ func New(confPath string) (*ConfWatcher, error) {
 
 // Close closes a ConfWatcher.
 func (w *ConfWatcher) Close() {
-	go func() {
-		for range w.signal {
-		}
-	}()
-	w.inner.Close()
+	close(w.terminate)
 	<-w.done
 }
 
@@ -95,15 +103,24 @@ outer:
 				previousWatchedPath = currentWatchedPath
 
 				lastCalled = time.Now()
-				w.signal <- struct{}{}
+
+				select {
+				case w.signal <- struct{}{}:
+				case <-w.terminate:
+					break outer
+				}
 			}
 
 		case <-w.inner.Errors:
+			break outer
+
+		case <-w.terminate:
 			break outer
 		}
 	}
 
 	close(w.signal)
+	w.inner.Close()
 }
 
 // Watch returns a channel that is called after the configuration file has changed.

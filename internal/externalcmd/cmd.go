@@ -1,6 +1,9 @@
+// Package externalcmd allows to launch external commands.
 package externalcmd
 
 import (
+	"errors"
+	"strings"
 	"time"
 )
 
@@ -8,70 +11,78 @@ const (
 	restartPause = 5 * time.Second
 )
 
+var errTerminated = errors.New("terminated")
+
 // Environment is a Cmd environment.
-type Environment struct {
-	Path string
-	Port string
-}
+type Environment map[string]string
 
 // Cmd is an external command.
 type Cmd struct {
+	pool    *Pool
 	cmdstr  string
 	restart bool
 	env     Environment
+	onExit  func(error)
 
 	// in
 	terminate chan struct{}
-
-	// out
-	done chan struct{}
 }
 
-// New allocates an Cmd.
-func New(cmdstr string, restart bool, env Environment) *Cmd {
+// NewCmd allocates a Cmd.
+func NewCmd(
+	pool *Pool,
+	cmdstr string,
+	restart bool,
+	env Environment,
+	onExit func(error),
+) *Cmd {
+	// replace variables in both Linux and Windows, in order to allow using the
+	// same commands on both of them.
+	for key, val := range env {
+		cmdstr = strings.ReplaceAll(cmdstr, "$"+key, val)
+	}
+
 	e := &Cmd{
+		pool:      pool,
 		cmdstr:    cmdstr,
 		restart:   restart,
 		env:       env,
+		onExit:    onExit,
 		terminate: make(chan struct{}),
-		done:      make(chan struct{}),
 	}
+
+	pool.wg.Add(1)
 
 	go e.run()
 
 	return e
 }
 
-// Close closes an Cmd.
+// Close closes the command. It doesn't wait for the command to exit.
 func (e *Cmd) Close() {
 	close(e.terminate)
-	<-e.done
 }
 
 func (e *Cmd) run() {
-	defer close(e.done)
+	defer e.pool.wg.Done()
 
 	for {
-		ok := func() bool {
-			ok := e.runInner()
-			if !ok {
-				return false
-			}
+		err := e.runOSSpecific()
+		if err == errTerminated {
+			return
+		}
 
-			if !e.restart {
-				<-e.terminate
-				return false
-			}
+		e.onExit(err)
 
-			select {
-			case <-time.After(restartPause):
-				return true
-			case <-e.terminate:
-				return false
-			}
-		}()
-		if !ok {
-			break
+		if !e.restart {
+			<-e.terminate
+			return
+		}
+
+		select {
+		case <-time.After(restartPause):
+		case <-e.terminate:
+			return
 		}
 	}
 }

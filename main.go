@@ -1,9 +1,10 @@
+// main executable.
 package main
 
 import (
 	"os"
 
-	"github.com/aler9/rtsp-simple-server/internal/core"
+	"github.com/bluenviron/mediamtx/internal/core"
 )
 
 func main() {

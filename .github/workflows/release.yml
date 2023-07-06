@@ -6,57 +6,93 @@ on:
     - 'v*'
 
 jobs:
-  github:
-    runs-on: ubuntu-20.04
+  binaries:
+    runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
 
-    - run: make release
+    - run: make binaries
 
-    - uses: actions/create-release@v1
-      id: create_release
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - uses: actions/upload-artifact@v3
       with:
-        tag_name: ${{ github.ref }}
-        release_name: ${{ github.ref }}
+        name: binaries
+        path: binaries
 
-    - uses: actions/github-script@v2
-      env:
-        RELEASE_ID: ${{ steps.create_release.outputs.id }}
+  github:
+    needs: binaries
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - uses: actions/download-artifact@v3
+      with:
+        name: binaries
+        path: binaries
+
+    - uses: actions/github-script@v6
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
           const fs = require('fs').promises;
           const { repo: { owner, repo } } = context;
 
-          for (let file of await fs.readdir('./release/')) {
-            await github.repos.uploadReleaseAsset({
+          const currentRelease = context.ref.split('/')[2];
+
+          const res = await github.rest.repos.createRelease({
+            owner,
+            repo,
+            tag_name: currentRelease,
+            name: currentRelease,
+          });
+          const release_id = res.data.id;
+
+          for (const name of await fs.readdir('./binaries/')) {
+            await github.rest.repos.uploadReleaseAsset({
               owner,
               repo,
-              release_id: process.env.RELEASE_ID,
-              name: file,
-              data: await fs.readFile(`./release/${file}`)
+              release_id,
+              name,
+              data: await fs.readFile(`./binaries/${name}`),
             });
           }
 
   dockerhub:
-    runs-on: ubuntu-20.04
+    needs: binaries
+    runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
+
+    - uses: actions/download-artifact@v3
+      with:
+        name: binaries
+        path: binaries
 
     - run: make dockerhub
       env:
         DOCKER_USER: ${{ secrets.DOCKER_USER }}
         DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
-  apidocs:
-    runs-on: ubuntu-20.04
+  dockerhub_legacy:
+    needs: dockerhub
+    runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
+
+    - run: make dockerhub-legacy
+      env:
+        DOCKER_USER_LEGACY: ${{ secrets.DOCKER_USER_LEGACY }}
+        DOCKER_PASSWORD_LEGACY: ${{ secrets.DOCKER_PASSWORD_LEGACY }}
+
+  apidocs:
+    needs: binaries
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v3
 
     - run: make apidocs-gen
 

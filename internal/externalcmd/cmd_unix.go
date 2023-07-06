@@ -1,42 +1,60 @@
 //go:build !windows
+// +build !windows
 
 package externalcmd
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
+
+	"github.com/kballard/go-shellquote"
 )
 
-func (e *Cmd) runInner() bool {
-	cmd := exec.Command("/bin/sh", "-c", "exec "+e.cmdstr)
+func (e *Cmd) runOSSpecific() error {
+	cmdParts, err := shellquote.Split(e.cmdstr)
+	if err != nil {
+		return err
+	}
 
-	cmd.Env = append(os.Environ(),
-		"RTSP_PATH="+e.env.Path,
-		"RTSP_PORT="+e.env.Port,
-	)
+	cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
+
+	cmd.Env = append([]string(nil), os.Environ()...)
+	for key, val := range e.env {
+		cmd.Env = append(cmd.Env, key+"="+val)
+	}
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	err := cmd.Start()
+	err = cmd.Start()
 	if err != nil {
-		return true
+		return err
 	}
 
-	cmdDone := make(chan struct{})
+	cmdDone := make(chan int)
 	go func() {
-		defer close(cmdDone)
-		cmd.Wait()
+		cmdDone <- func() int {
+			err := cmd.Wait()
+			if err == nil {
+				return 0
+			}
+			ee, ok := err.(*exec.ExitError)
+			if !ok {
+				return 0
+			}
+			return ee.ExitCode()
+		}()
 	}()
 
 	select {
 	case <-e.terminate:
 		syscall.Kill(cmd.Process.Pid, syscall.SIGINT)
 		<-cmdDone
-		return false
+		return errTerminated
 
-	case <-cmdDone:
-		return true
+	case c := <-cmdDone:
+		return fmt.Errorf("command returned code %d", c)
 	}
 }

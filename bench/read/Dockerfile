@@ -1,4 +1,4 @@
-FROM golang:1.17-alpine3.13
+FROM golang:1.20-alpine3.17
 
 RUN apk add --no-cache \
     ffmpeg
@@ -11,7 +11,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . ./
-RUN go build -o /rtsp-simple-server .
+RUN go build -o /mediamtx .
 
 COPY bench/read/start.sh /
 RUN chmod +x /start.sh

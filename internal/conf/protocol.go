@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/aler9/gortsplib"
+	"github.com/bluenviron/gortsplib/v3"
 )
 
 // Protocol is a RTSP transport.
@@ -15,7 +15,7 @@ type Protocol gortsplib.Transport
 // Protocols is the protocols parameter.
 type Protocols map[Protocol]struct{}
 
-// MarshalJSON marshals a Protocols into JSON.
+// MarshalJSON implements json.Marshaler.
 func (d Protocols) MarshalJSON() ([]byte, error) {
 	out := make([]string, len(d))
 	i := 0
@@ -30,8 +30,11 @@ func (d Protocols) MarshalJSON() ([]byte, error) {
 		case Protocol(gortsplib.TransportUDPMulticast):
 			v = "multicast"
 
-		default:
+		case Protocol(gortsplib.TransportTCP):
 			v = "tcp"
+
+		default:
+			return nil, fmt.Errorf("invalid protocol: %v", p)
 		}
 
 		out[i] = v
@@ -43,7 +46,7 @@ func (d Protocols) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
-// UnmarshalJSON unmarshals a Protocols from JSON.
+// UnmarshalJSON implements json.Unmarshaler.
 func (d *Protocols) UnmarshalJSON(b []byte) error {
 	var in []string
 	if err := json.Unmarshal(b, &in); err != nil {
@@ -71,7 +74,8 @@ func (d *Protocols) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (d *Protocols) unmarshalEnv(s string) error {
+// UnmarshalEnv implements envUnmarshaler.
+func (d *Protocols) UnmarshalEnv(s string) error {
 	byts, _ := json.Marshal(strings.Split(s, ","))
 	return d.UnmarshalJSON(byts)
 }
