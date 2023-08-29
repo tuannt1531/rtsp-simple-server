@@ -4,13 +4,14 @@ import (
 	"context"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/media"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
-	"github.com/bluenviron/mediamtx/internal/formatprocessor"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/rpicamera"
+	"github.com/bluenviron/mediamtx/internal/stream"
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
 func paramsFromConf(cnf *conf.PathConf) rpicamera.Params {
@@ -32,6 +33,7 @@ func paramsFromConf(cnf *conf.PathConf) rpicamera.Params {
 		Gain:              cnf.RPICameraGain,
 		EV:                cnf.RPICameraEV,
 		ROI:               cnf.RPICameraROI,
+		HDR:               cnf.RPICameraHDR,
 		TuningFile:        cnf.RPICameraTuningFile,
 		Mode:              cnf.RPICameraMode,
 		FPS:               cnf.RPICameraFPS,
@@ -51,8 +53,8 @@ func paramsFromConf(cnf *conf.PathConf) rpicamera.Params {
 
 type rpiCameraSourceParent interface {
 	logger.Writer
-	sourceStaticImplSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
-	sourceStaticImplSetNotReady(req pathSourceStaticSetNotReadyReq)
+	setReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
+	setNotReady(req pathSourceStaticSetNotReadyReq)
 }
 
 type rpiCameraSource struct {
@@ -68,39 +70,40 @@ func newRPICameraSource(
 }
 
 func (s *rpiCameraSource) Log(level logger.Level, format string, args ...interface{}) {
-	s.parent.Log(level, "[rpicamera source] "+format, args...)
+	s.parent.Log(level, "[RPI Camera source] "+format, args...)
 }
 
 // run implements sourceStaticImpl.
 func (s *rpiCameraSource) run(ctx context.Context, cnf *conf.PathConf, reloadConf chan *conf.PathConf) error {
-	medi := &media.Media{
-		Type: media.TypeVideo,
-		Formats: []formats.Format{&formats.H264{
+	medi := &description.Media{
+		Type: description.MediaTypeVideo,
+		Formats: []format.Format{&format.H264{
 			PayloadTyp:        96,
 			PacketizationMode: 1,
 		}},
 	}
-	medias := media.Medias{medi}
-	var stream *stream
+	medias := []*description.Media{medi}
+	var stream *stream.Stream
 
 	onData := func(dts time.Duration, au [][]byte) {
 		if stream == nil {
-			res := s.parent.sourceStaticImplSetReady(pathSourceStaticSetReadyReq{
-				medias:             medias,
+			res := s.parent.setReady(pathSourceStaticSetReadyReq{
+				desc:               &description.Session{Medias: medias},
 				generateRTPPackets: true,
 			})
 			if res.err != nil {
 				return
 			}
 
-			s.Log(logger.Info, "ready: %s", sourceMediaInfo(medias))
 			stream = res.stream
 		}
 
-		stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitH264{
-			PTS: dts,
-			AU:  au,
-			NTP: time.Now(),
+		stream.WriteUnit(medi, medi.Formats[0], &unit.H264{
+			Base: unit.Base{
+				NTP: time.Now(),
+				PTS: dts,
+			},
+			AU: au,
 		})
 	}
 
@@ -112,7 +115,7 @@ func (s *rpiCameraSource) run(ctx context.Context, cnf *conf.PathConf, reloadCon
 
 	defer func() {
 		if stream != nil {
-			s.parent.sourceStaticImplSetNotReady(pathSourceStaticSetNotReadyReq{})
+			s.parent.setNotReady(pathSourceStaticSetNotReadyReq{})
 		}
 	}()
 

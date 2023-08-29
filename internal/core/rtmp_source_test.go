@@ -6,15 +6,14 @@ import (
 	"os"
 	"testing"
 
-	"github.com/bluenviron/gortsplib/v3"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/url"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/url"
 	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 
 	"github.com/bluenviron/mediamtx/internal/rtmp"
-	"github.com/bluenviron/mediamtx/internal/rtmp/message"
 )
 
 func TestRTMPSource(t *testing.T) {
@@ -53,12 +52,11 @@ func TestRTMPSource(t *testing.T) {
 				nconn, err := ln.Accept()
 				require.NoError(t, err)
 				defer nconn.Close()
-				conn := rtmp.NewConn(nconn)
 
-				_, _, err = conn.InitializeServer()
+				conn, _, _, err := rtmp.NewServerConn(nconn)
 				require.NoError(t, err)
 
-				videoTrack := &formats.H264{
+				videoTrack := &format.H264{
 					PayloadTyp: 96,
 					SPS: []byte{ // 1920x1080 baseline
 						0x67, 0x42, 0xc0, 0x28, 0xd9, 0x00, 0x78, 0x02,
@@ -69,7 +67,7 @@ func TestRTMPSource(t *testing.T) {
 					PacketizationMode: 1,
 				}
 
-				audioTrack := &formats.MPEG4Audio{
+				audioTrack := &format.MPEG4Audio{
 					PayloadTyp: 96,
 					Config: &mpeg4audio.Config{
 						Type:         2,
@@ -81,19 +79,12 @@ func TestRTMPSource(t *testing.T) {
 					IndexDeltaLength: 3,
 				}
 
-				err = conn.WriteTracks(videoTrack, audioTrack)
+				w, err := rtmp.NewWriter(conn, videoTrack, audioTrack)
 				require.NoError(t, err)
 
 				<-connected
 
-				err = conn.WriteMessage(&message.Video{
-					ChunkStreamID:   message.VideoChunkStreamID,
-					MessageStreamID: 0x1000000,
-					Codec:           message.CodecH264,
-					IsKeyFrame:      true,
-					Type:            message.VideoTypeAU,
-					Payload:         []byte{0x00, 0x00, 0x00, 0x04, 0x05, 0x02, 0x03, 0x04},
-				})
+				err = w.WriteH264(0, 0, true, [][]byte{{0x05, 0x02, 0x03, 0x04}})
 				require.NoError(t, err)
 
 				<-done
@@ -125,13 +116,16 @@ func TestRTMPSource(t *testing.T) {
 			require.NoError(t, err)
 			defer c.Close()
 
-			medias, baseURL, _, err := c.Describe(u)
+			desc, _, err := c.Describe(u)
 			require.NoError(t, err)
 
-			err = c.SetupAll(medias, baseURL)
+			var forma *format.H264
+			medi := desc.FindFormat(&forma)
+
+			_, err = c.Setup(desc.BaseURL, medi, 0, 0)
 			require.NoError(t, err)
 
-			c.OnPacketRTP(medias[0], medias[0].Formats[0], func(pkt *rtp.Packet) {
+			c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
 				require.Equal(t, []byte{
 					0x18, 0x0, 0x19, 0x67, 0x42, 0xc0, 0x28, 0xd9,
 					0x0, 0x78, 0x2, 0x27, 0xe5, 0x84, 0x0, 0x0,

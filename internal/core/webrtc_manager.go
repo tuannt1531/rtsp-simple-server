@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pion/ice/v2"
+	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v3"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
@@ -23,40 +24,194 @@ import (
 )
 
 const (
+	webrtcPauseAfterAuthError  = 2 * time.Second
 	webrtcHandshakeTimeout     = 10 * time.Second
-	webrtcTrackGatherTimeout   = 2 * time.Second
+	webrtcTrackGatherTimeout   = 3 * time.Second
 	webrtcPayloadMaxSize       = 1188 // 1200 - 12 (RTP header)
 	webrtcStreamID             = "mediamtx"
 	webrtcTurnSecretExpiration = 24 * 3600 * time.Second
 )
 
-func randInt63() int64 {
+var videoCodecs = []webrtc.RTPCodecParameters{
+	{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypeAV1,
+			ClockRate: 90000,
+		},
+		PayloadType: 96,
+	},
+	{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeVP9,
+			ClockRate:   90000,
+			SDPFmtpLine: "profile-id=0",
+		},
+		PayloadType: 97,
+	},
+	{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeVP9,
+			ClockRate:   90000,
+			SDPFmtpLine: "profile-id=1",
+		},
+		PayloadType: 98,
+	},
+	{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypeVP8,
+			ClockRate: 90000,
+		},
+		PayloadType: 99,
+	},
+	{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
+		},
+		PayloadType: 100,
+	},
+	{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		},
+		PayloadType: 101,
+	},
+}
+
+var audioCodecs = []webrtc.RTPCodecParameters{
+	{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeOpus,
+			ClockRate:   48000,
+			Channels:    2,
+			SDPFmtpLine: "minptime=10;useinbandfec=1",
+		},
+		PayloadType: 111,
+	},
+	{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypeG722,
+			ClockRate: 8000,
+		},
+		PayloadType: 9,
+	},
+	{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypePCMU,
+			ClockRate: 8000,
+		},
+		PayloadType: 0,
+	},
+	{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypePCMA,
+			ClockRate: 8000,
+		},
+		PayloadType: 8,
+	},
+}
+
+func randInt63() (int64, error) {
 	var b [8]byte
-	rand.Read(b[:])
+	_, err := rand.Read(b[:])
+	if err != nil {
+		return 0, err
+	}
+
 	return int64(uint64(b[0]&0b01111111)<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
-		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7]))
+		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])), nil
 }
 
 // https://cs.opensource.google/go/go/+/refs/tags/go1.20.4:src/math/rand/rand.go;l=119
-func randInt63n(n int64) int64 {
+func randInt63n(n int64) (int64, error) {
 	if n&(n-1) == 0 { // n is power of two, can mask
-		return randInt63() & (n - 1)
+		r, err := randInt63()
+		if err != nil {
+			return 0, err
+		}
+		return r & (n - 1), nil
 	}
+
 	max := int64((1 << 63) - 1 - (1<<63)%uint64(n))
-	v := randInt63()
-	for v > max {
-		v = randInt63()
+
+	v, err := randInt63()
+	if err != nil {
+		return 0, err
 	}
-	return v % n
+
+	for v > max {
+		v, err = randInt63()
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	return v % n, nil
 }
 
-func randomTurnUser() string {
+func randomTurnUser() (string, error) {
 	const charset = "abcdefghijklmnopqrstuvwxyz1234567890"
 	b := make([]byte, 20)
 	for i := range b {
-		b[i] = charset[int(randInt63n(int64(len(charset))))]
+		j, err := randInt63n(int64(len(charset)))
+		if err != nil {
+			return "", err
+		}
+
+		b[i] = charset[int(j)]
 	}
-	return string(b)
+
+	return string(b), nil
+}
+
+func webrtcNewAPI(
+	iceHostNAT1To1IPs []string,
+	iceUDPMux ice.UDPMux,
+	iceTCPMux ice.TCPMux,
+) (*webrtc.API, error) {
+	settingsEngine := webrtc.SettingEngine{}
+
+	if len(iceHostNAT1To1IPs) != 0 {
+		settingsEngine.SetNAT1To1IPs(iceHostNAT1To1IPs, webrtc.ICECandidateTypeHost)
+	}
+
+	if iceUDPMux != nil {
+		settingsEngine.SetICEUDPMux(iceUDPMux)
+	}
+
+	if iceTCPMux != nil {
+		settingsEngine.SetICETCPMux(iceTCPMux)
+		settingsEngine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeTCP4})
+	}
+
+	mediaEngine := &webrtc.MediaEngine{}
+
+	for _, codec := range videoCodecs {
+		err := mediaEngine.RegisterCodec(codec, webrtc.RTPCodecTypeVideo)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, codec := range audioCodecs {
+		err := mediaEngine.RegisterCodec(codec, webrtc.RTPCodecTypeAudio)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	interceptorRegistry := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptorRegistry); err != nil {
+		return nil, err
+	}
+
+	return webrtc.NewAPI(
+		webrtc.WithSettingEngine(settingsEngine),
+		webrtc.WithMediaEngine(mediaEngine),
+		webrtc.WithInterceptorRegistry(interceptorRegistry)), nil
 }
 
 type webRTCManagerAPISessionsListRes struct {
@@ -66,15 +221,6 @@ type webRTCManagerAPISessionsListRes struct {
 
 type webRTCManagerAPISessionsListReq struct {
 	res chan webRTCManagerAPISessionsListRes
-}
-
-type webRTCManagerAPISessionsKickRes struct {
-	err error
-}
-
-type webRTCManagerAPISessionsKickReq struct {
-	uuid uuid.UUID
-	res  chan webRTCManagerAPISessionsKickRes
 }
 
 type webRTCManagerAPISessionsGetRes struct {
@@ -87,30 +233,42 @@ type webRTCManagerAPISessionsGetReq struct {
 	res  chan webRTCManagerAPISessionsGetRes
 }
 
-type webRTCSessionNewRes struct {
+type webRTCManagerAPISessionsKickRes struct {
+	err error
+}
+
+type webRTCManagerAPISessionsKickReq struct {
+	uuid uuid.UUID
+	res  chan webRTCManagerAPISessionsKickRes
+}
+
+type webRTCNewSessionRes struct {
 	sx            *webRTCSession
 	answer        []byte
 	err           error
 	errStatusCode int
 }
 
-type webRTCSessionNewReq struct {
+type webRTCNewSessionReq struct {
 	pathName   string
 	remoteAddr string
+	query      string
+	user       string
+	pass       string
 	offer      []byte
 	publish    bool
-	res        chan webRTCSessionNewRes
+	res        chan webRTCNewSessionRes
 }
 
-type webRTCSessionAddCandidatesRes struct {
+type webRTCAddSessionCandidatesRes struct {
 	sx  *webRTCSession
 	err error
 }
 
-type webRTCSessionAddCandidatesReq struct {
+type webRTCAddSessionCandidatesReq struct {
 	secret     uuid.UUID
 	candidates []*webrtc.ICECandidateInit
-	res        chan webRTCSessionAddCandidatesRes
+	res        chan webRTCAddSessionCandidatesRes
 }
 
 type webRTCManagerParent interface {
@@ -118,29 +276,27 @@ type webRTCManagerParent interface {
 }
 
 type webRTCManager struct {
-	allowOrigin     string
-	trustedProxies  conf.IPsOrCIDRs
-	iceServers      []conf.WebRTCICEServer
-	readBufferCount int
-	pathManager     *pathManager
-	metrics         *metrics
-	parent          webRTCManagerParent
+	allowOrigin    string
+	trustedProxies conf.IPsOrCIDRs
+	iceServers     []conf.WebRTCICEServer
+	writeQueueSize int
+	pathManager    *pathManager
+	metrics        *metrics
+	parent         webRTCManagerParent
 
-	ctx               context.Context
-	ctxCancel         func()
-	httpServer        *webRTCHTTPServer
-	udpMuxLn          net.PacketConn
-	tcpMuxLn          net.Listener
-	sessions          map[*webRTCSession]struct{}
-	sessionsBySecret  map[uuid.UUID]*webRTCSession
-	iceHostNAT1To1IPs []string
-	iceUDPMux         ice.UDPMux
-	iceTCPMux         ice.TCPMux
+	ctx              context.Context
+	ctxCancel        func()
+	httpServer       *webRTCHTTPServer
+	udpMuxLn         net.PacketConn
+	tcpMuxLn         net.Listener
+	api              *webrtc.API
+	sessions         map[*webRTCSession]struct{}
+	sessionsBySecret map[uuid.UUID]*webRTCSession
 
 	// in
-	chSessionNew           chan webRTCSessionNewReq
-	chSessionClose         chan *webRTCSession
-	chSessionAddCandidates chan webRTCSessionAddCandidatesReq
+	chNewSession           chan webRTCNewSessionReq
+	chCloseSession         chan *webRTCSession
+	chAddSessionCandidates chan webRTCAddSessionCandidatesReq
 	chAPISessionsList      chan webRTCManagerAPISessionsListReq
 	chAPISessionsGet       chan webRTCManagerAPISessionsGetReq
 	chAPIConnsKick         chan webRTCManagerAPISessionsKickReq
@@ -150,7 +306,6 @@ type webRTCManager struct {
 }
 
 func newWebRTCManager(
-	parentCtx context.Context,
 	address string,
 	encryption bool,
 	serverKey string,
@@ -159,32 +314,31 @@ func newWebRTCManager(
 	trustedProxies conf.IPsOrCIDRs,
 	iceServers []conf.WebRTCICEServer,
 	readTimeout conf.StringDuration,
-	readBufferCount int,
-	pathManager *pathManager,
-	metrics *metrics,
-	parent webRTCManagerParent,
+	writeQueueSize int,
 	iceHostNAT1To1IPs []string,
 	iceUDPMuxAddress string,
 	iceTCPMuxAddress string,
+	pathManager *pathManager,
+	metrics *metrics,
+	parent webRTCManagerParent,
 ) (*webRTCManager, error) {
-	ctx, ctxCancel := context.WithCancel(parentCtx)
+	ctx, ctxCancel := context.WithCancel(context.Background())
 
 	m := &webRTCManager{
 		allowOrigin:            allowOrigin,
 		trustedProxies:         trustedProxies,
 		iceServers:             iceServers,
-		readBufferCount:        readBufferCount,
+		writeQueueSize:         writeQueueSize,
 		pathManager:            pathManager,
 		metrics:                metrics,
 		parent:                 parent,
 		ctx:                    ctx,
 		ctxCancel:              ctxCancel,
-		iceHostNAT1To1IPs:      iceHostNAT1To1IPs,
 		sessions:               make(map[*webRTCSession]struct{}),
 		sessionsBySecret:       make(map[uuid.UUID]*webRTCSession),
-		chSessionNew:           make(chan webRTCSessionNewReq),
-		chSessionClose:         make(chan *webRTCSession),
-		chSessionAddCandidates: make(chan webRTCSessionAddCandidatesReq),
+		chNewSession:           make(chan webRTCNewSessionReq),
+		chCloseSession:         make(chan *webRTCSession),
+		chAddSessionCandidates: make(chan webRTCAddSessionCandidatesReq),
 		chAPISessionsList:      make(chan webRTCManagerAPISessionsListReq),
 		chAPISessionsGet:       make(chan webRTCManagerAPISessionsGetReq),
 		chAPIConnsKick:         make(chan webRTCManagerAPISessionsKickReq),
@@ -208,6 +362,8 @@ func newWebRTCManager(
 		return nil, err
 	}
 
+	var iceUDPMux ice.UDPMux
+
 	if iceUDPMuxAddress != "" {
 		m.udpMuxLn, err = net.ListenPacket(restrictNetwork("udp", iceUDPMuxAddress))
 		if err != nil {
@@ -215,8 +371,10 @@ func newWebRTCManager(
 			ctxCancel()
 			return nil, err
 		}
-		m.iceUDPMux = webrtc.NewICEUDPMux(nil, m.udpMuxLn)
+		iceUDPMux = webrtc.NewICEUDPMux(nil, m.udpMuxLn)
 	}
+
+	var iceTCPMux ice.TCPMux
 
 	if iceTCPMuxAddress != "" {
 		m.tcpMuxLn, err = net.Listen(restrictNetwork("tcp", iceTCPMuxAddress))
@@ -226,7 +384,16 @@ func newWebRTCManager(
 			ctxCancel()
 			return nil, err
 		}
-		m.iceTCPMux = webrtc.NewICETCPMux(nil, m.tcpMuxLn, 8)
+		iceTCPMux = webrtc.NewICETCPMux(nil, m.tcpMuxLn, 8)
+	}
+
+	m.api, err = webrtcNewAPI(iceHostNAT1To1IPs, iceUDPMux, iceTCPMux)
+	if err != nil {
+		m.udpMuxLn.Close()
+		m.tcpMuxLn.Close()
+		m.httpServer.close()
+		ctxCancel()
+		return nil, err
 	}
 
 	str := "listener opened on " + address + " (HTTP)"
@@ -266,34 +433,32 @@ func (m *webRTCManager) run() {
 outer:
 	for {
 		select {
-		case req := <-m.chSessionNew:
+		case req := <-m.chNewSession:
 			sx := newWebRTCSession(
 				m.ctx,
-				m.readBufferCount,
+				m.writeQueueSize,
+				m.api,
 				req,
 				&wg,
-				m.iceHostNAT1To1IPs,
-				m.iceUDPMux,
-				m.iceTCPMux,
 				m.pathManager,
 				m,
 			)
 			m.sessions[sx] = struct{}{}
 			m.sessionsBySecret[sx.secret] = sx
-			req.res <- webRTCSessionNewRes{sx: sx}
+			req.res <- webRTCNewSessionRes{sx: sx}
 
-		case sx := <-m.chSessionClose:
+		case sx := <-m.chCloseSession:
 			delete(m.sessions, sx)
 			delete(m.sessionsBySecret, sx.secret)
 
-		case req := <-m.chSessionAddCandidates:
+		case req := <-m.chAddSessionCandidates:
 			sx, ok := m.sessionsBySecret[req.secret]
 			if !ok {
-				req.res <- webRTCSessionAddCandidatesRes{err: fmt.Errorf("session not found")}
+				req.res <- webRTCAddSessionCandidatesRes{err: fmt.Errorf("session not found")}
 				continue
 			}
 
-			req.res <- webRTCSessionAddCandidatesRes{sx: sx}
+			req.res <- webRTCAddSessionCandidatesRes{sx: sx}
 
 		case req := <-m.chAPISessionsList:
 			data := &apiWebRTCSessionsList{
@@ -360,14 +525,23 @@ func (m *webRTCManager) findSessionByUUID(uuid uuid.UUID) *webRTCSession {
 	return nil
 }
 
-func (m *webRTCManager) generateICEServers() []webrtc.ICEServer {
+func (m *webRTCManager) generateICEServers() ([]webrtc.ICEServer, error) {
 	ret := make([]webrtc.ICEServer, len(m.iceServers))
+
 	for i, server := range m.iceServers {
 		if server.Username == "AUTH_SECRET" {
 			expireDate := time.Now().Add(webrtcTurnSecretExpiration).Unix()
-			server.Username = strconv.FormatInt(expireDate, 10) + ":" + randomTurnUser()
+
+			user, err := randomTurnUser()
+			if err != nil {
+				return nil, err
+			}
+
+			server.Username = strconv.FormatInt(expireDate, 10) + ":" + user
+
 			h := hmac.New(sha1.New, []byte(server.Password))
 			h.Write([]byte(server.Username))
+
 			server.Password = base64.StdEncoding.EncodeToString(h.Sum(nil))
 		}
 
@@ -377,54 +551,49 @@ func (m *webRTCManager) generateICEServers() []webrtc.ICEServer {
 			Credential: server.Password,
 		}
 	}
-	return ret
+
+	return ret, nil
 }
 
-// sessionNew is called by webRTCHTTPServer.
-func (m *webRTCManager) sessionNew(req webRTCSessionNewReq) webRTCSessionNewRes {
-	req.res = make(chan webRTCSessionNewRes)
+// newSession is called by webRTCHTTPServer.
+func (m *webRTCManager) newSession(req webRTCNewSessionReq) webRTCNewSessionRes {
+	req.res = make(chan webRTCNewSessionRes)
 
 	select {
-	case m.chSessionNew <- req:
-		res1 := <-req.res
+	case m.chNewSession <- req:
+		res := <-req.res
 
-		select {
-		case res2 := <-req.res:
-			return res2
-
-		case <-res1.sx.ctx.Done():
-			return webRTCSessionNewRes{err: fmt.Errorf("terminated"), errStatusCode: http.StatusInternalServerError}
-		}
+		return res.sx.new(req)
 
 	case <-m.ctx.Done():
-		return webRTCSessionNewRes{err: fmt.Errorf("terminated"), errStatusCode: http.StatusInternalServerError}
+		return webRTCNewSessionRes{err: fmt.Errorf("terminated"), errStatusCode: http.StatusInternalServerError}
 	}
 }
 
-// sessionClose is called by webRTCSession.
-func (m *webRTCManager) sessionClose(sx *webRTCSession) {
+// closeSession is called by webRTCSession.
+func (m *webRTCManager) closeSession(sx *webRTCSession) {
 	select {
-	case m.chSessionClose <- sx:
+	case m.chCloseSession <- sx:
 	case <-m.ctx.Done():
 	}
 }
 
-// sessionAddCandidates is called by webRTCHTTPServer.
-func (m *webRTCManager) sessionAddCandidates(
-	req webRTCSessionAddCandidatesReq,
-) webRTCSessionAddCandidatesRes {
-	req.res = make(chan webRTCSessionAddCandidatesRes)
+// addSessionCandidates is called by webRTCHTTPServer.
+func (m *webRTCManager) addSessionCandidates(
+	req webRTCAddSessionCandidatesReq,
+) webRTCAddSessionCandidatesRes {
+	req.res = make(chan webRTCAddSessionCandidatesRes)
 	select {
-	case m.chSessionAddCandidates <- req:
+	case m.chAddSessionCandidates <- req:
 		res1 := <-req.res
 		if res1.err != nil {
 			return res1
 		}
 
-		return res1.sx.addRemoteCandidates(req)
+		return res1.sx.addCandidates(req)
 
 	case <-m.ctx.Done():
-		return webRTCSessionAddCandidatesRes{err: fmt.Errorf("terminated")}
+		return webRTCAddSessionCandidatesRes{err: fmt.Errorf("terminated")}
 	}
 }
 

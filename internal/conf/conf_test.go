@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3"
+	"github.com/bluenviron/gortsplib/v4"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/nacl/secretbox"
 
@@ -51,6 +51,7 @@ func TestConfFromFile(t *testing.T) {
 			Source:                     "publisher",
 			SourceOnDemandStartTimeout: 10 * StringDuration(time.Second),
 			SourceOnDemandCloseAfter:   10 * StringDuration(time.Second),
+			OverridePublisher:          true,
 			RPICameraWidth:             1920,
 			RPICameraHeight:            1080,
 			RPICameraContrast:          1,
@@ -120,6 +121,7 @@ func TestConfFromFileAndEnv(t *testing.T) {
 		Source:                     "rtsp://testing",
 		SourceOnDemandStartTimeout: 10 * StringDuration(time.Second),
 		SourceOnDemandCloseAfter:   10 * StringDuration(time.Second),
+		OverridePublisher:          true,
 		RPICameraWidth:             1920,
 		RPICameraHeight:            1080,
 		RPICameraContrast:          1,
@@ -150,6 +152,7 @@ func TestConfFromEnvOnly(t *testing.T) {
 		Source:                     "rtsp://testing",
 		SourceOnDemandStartTimeout: 10 * StringDuration(time.Second),
 		SourceOnDemandCloseAfter:   10 * StringDuration(time.Second),
+		OverridePublisher:          true,
 		RPICameraWidth:             1920,
 		RPICameraHeight:            1080,
 		RPICameraContrast:          1,
@@ -177,9 +180,8 @@ func TestConfEncryption(t *testing.T) {
 		copy(secretKey[:], key)
 
 		var nonce [24]byte
-		if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
-			panic(err)
-		}
+		_, err := io.ReadFull(rand.Reader, nonce[:])
+		require.NoError(t, err)
 
 		encrypted := secretbox.Seal(nonce[:], []byte(plaintext), &nonce, &secretKey)
 		return base64.StdEncoding.EncodeToString(encrypted)
@@ -215,9 +217,9 @@ func TestConfErrors(t *testing.T) {
 			"json: unknown field \"invalid\"",
 		},
 		{
-			"invalid readBufferCount",
-			"readBufferCount: 1001\n",
-			"'readBufferCount' must be a power of two",
+			"invalid writeQueueSize",
+			"writeQueueSize: 1001\n",
+			"'writeQueueSize' must be a power of two",
 		},
 		{
 			"invalid udpMaxPayloadSize",

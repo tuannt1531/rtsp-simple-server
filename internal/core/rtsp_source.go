@@ -2,53 +2,17 @@ package core
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/tls"
-	"encoding/hex"
-	"fmt"
-	"strings"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3"
-	"github.com/bluenviron/gortsplib/v3/pkg/base"
-	"github.com/bluenviron/gortsplib/v3/pkg/headers"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/headers"
 	"github.com/pion/rtp"
 
-	"github.com/bluenviron/gortsplib/v3/pkg/url"
+	"github.com/bluenviron/gortsplib/v4/pkg/url"
 	"github.com/bluenviron/mediamtx/internal/conf"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
-
-type rtspSourceParent interface {
-	logger.Writer
-	sourceStaticImplSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
-	sourceStaticImplSetNotReady(req pathSourceStaticSetNotReadyReq)
-}
-
-type rtspSource struct {
-	readTimeout     conf.StringDuration
-	writeTimeout    conf.StringDuration
-	readBufferCount int
-	parent          rtspSourceParent
-}
-
-func newRTSPSource(
-	readTimeout conf.StringDuration,
-	writeTimeout conf.StringDuration,
-	readBufferCount int,
-	parent rtspSourceParent,
-) *rtspSource {
-	return &rtspSource{
-		readTimeout:     readTimeout,
-		writeTimeout:    writeTimeout,
-		readBufferCount: readBufferCount,
-		parent:          parent,
-	}
-}
-
-func (s *rtspSource) Log(level logger.Level, format string, args ...interface{}) {
-	s.parent.Log(level, "[rtsp source] "+format, args...)
-}
 
 func createRangeHeader(cnf *conf.PathConf) (*headers.Range, error) {
 	switch cnf.RtspRangeType {
@@ -95,37 +59,50 @@ func createRangeHeader(cnf *conf.PathConf) (*headers.Range, error) {
 	}
 }
 
+type rtspSourceParent interface {
+	logger.Writer
+	setReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
+	setNotReady(req pathSourceStaticSetNotReadyReq)
+}
+
+type rtspSource struct {
+	readTimeout    conf.StringDuration
+	writeTimeout   conf.StringDuration
+	writeQueueSize int
+	parent         rtspSourceParent
+}
+
+func newRTSPSource(
+	readTimeout conf.StringDuration,
+	writeTimeout conf.StringDuration,
+	writeQueueSize int,
+	parent rtspSourceParent,
+) *rtspSource {
+	return &rtspSource{
+		readTimeout:    readTimeout,
+		writeTimeout:   writeTimeout,
+		writeQueueSize: writeQueueSize,
+		parent:         parent,
+	}
+}
+
+func (s *rtspSource) Log(level logger.Level, format string, args ...interface{}) {
+	s.parent.Log(level, "[RTSP source] "+format, args...)
+}
+
 // run implements sourceStaticImpl.
 func (s *rtspSource) run(ctx context.Context, cnf *conf.PathConf, reloadConf chan *conf.PathConf) error {
 	s.Log(logger.Debug, "connecting")
 
-	var tlsConfig *tls.Config
-	if cnf.SourceFingerprint != "" {
-		tlsConfig = &tls.Config{
-			InsecureSkipVerify: true,
-			VerifyConnection: func(cs tls.ConnectionState) error {
-				h := sha256.New()
-				h.Write(cs.PeerCertificates[0].Raw)
-				hstr := hex.EncodeToString(h.Sum(nil))
-				fingerprintLower := strings.ToLower(cnf.SourceFingerprint)
-
-				if hstr != fingerprintLower {
-					return fmt.Errorf("server fingerprint do not match: expected %s, got %s",
-						fingerprintLower, hstr)
-				}
-
-				return nil
-			},
-		}
-	}
+	decodeErrLogger := newLimitedLogger(s)
 
 	c := &gortsplib.Client{
-		Transport:       cnf.SourceProtocol.Transport,
-		TLSConfig:       tlsConfig,
-		ReadTimeout:     time.Duration(s.readTimeout),
-		WriteTimeout:    time.Duration(s.writeTimeout),
-		ReadBufferCount: s.readBufferCount,
-		AnyPortEnable:   cnf.SourceAnyPortEnable,
+		Transport:      cnf.SourceProtocol.Transport,
+		TLSConfig:      tlsConfigForFingerprint(cnf.SourceFingerprint),
+		ReadTimeout:    time.Duration(s.readTimeout),
+		WriteTimeout:   time.Duration(s.writeTimeout),
+		WriteQueueSize: s.writeQueueSize,
+		AnyPortEnable:  cnf.SourceAnyPortEnable,
 		OnRequest: func(req *base.Request) {
 			s.Log(logger.Debug, "c->s %v", req)
 		},
@@ -136,10 +113,10 @@ func (s *rtspSource) run(ctx context.Context, cnf *conf.PathConf, reloadConf cha
 			s.Log(logger.Warn, err.Error())
 		},
 		OnPacketLost: func(err error) {
-			s.Log(logger.Warn, err.Error())
+			decodeErrLogger.Log(logger.Warn, err.Error())
 		},
 		OnDecodeError: func(err error) {
-			s.Log(logger.Warn, err.Error())
+			decodeErrLogger.Log(logger.Warn, err.Error())
 		},
 	}
 
@@ -157,35 +134,38 @@ func (s *rtspSource) run(ctx context.Context, cnf *conf.PathConf, reloadConf cha
 	readErr := make(chan error)
 	go func() {
 		readErr <- func() error {
-			medias, baseURL, _, err := c.Describe(u)
+			desc, _, err := c.Describe(u)
 			if err != nil {
 				return err
 			}
 
-			err = c.SetupAll(medias, baseURL)
+			err = c.SetupAll(desc.BaseURL, desc.Medias)
 			if err != nil {
 				return err
 			}
 
-			res := s.parent.sourceStaticImplSetReady(pathSourceStaticSetReadyReq{
-				medias:             medias,
+			res := s.parent.setReady(pathSourceStaticSetReadyReq{
+				desc:               desc,
 				generateRTPPackets: false,
 			})
 			if res.err != nil {
 				return res.err
 			}
 
-			s.Log(logger.Info, "ready: %s", sourceMediaInfo(medias))
+			defer s.parent.setNotReady(pathSourceStaticSetNotReadyReq{})
 
-			defer s.parent.sourceStaticImplSetNotReady(pathSourceStaticSetNotReadyReq{})
-
-			for _, medi := range medias {
+			for _, medi := range desc.Medias {
 				for _, forma := range medi.Formats {
 					cmedi := medi
 					cforma := forma
 
 					c.OnPacketRTP(cmedi, cforma, func(pkt *rtp.Packet) {
-						res.stream.writeRTPPacket(cmedi, cforma, pkt, time.Now())
+						pts, ok := c.PacketPTS(cmedi, pkt)
+						if !ok {
+							return
+						}
+
+						res.stream.WriteRTPPacket(cmedi, cforma, pkt, time.Now(), pts)
 					})
 				}
 			}

@@ -7,15 +7,24 @@ import (
 	"net/http"
 	gopath "path"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/httpserv"
 	"github.com/bluenviron/mediamtx/internal/logger"
+)
+
+const (
+	hlsPauseAfterAuthError = 2 * time.Second
 )
 
 //go:embed hls_index.html
 var hlsIndex []byte
+
+//go:embed hls.min.js
+var hlsMinJS []byte
 
 type hlsHTTPServerParent interface {
 	logger.Writer
@@ -27,7 +36,7 @@ type hlsHTTPServer struct {
 	pathManager *pathManager
 	parent      hlsHTTPServerParent
 
-	inner *httpServer
+	inner *httpserv.WrappedServer
 }
 
 func newHLSHTTPServer( //nolint:dupl
@@ -57,17 +66,21 @@ func newHLSHTTPServer( //nolint:dupl
 	}
 
 	router := gin.New()
-	httpSetTrustedProxies(router, trustedProxies)
+	router.SetTrustedProxies(trustedProxies.ToTrustedProxies()) //nolint:errcheck
 
-	router.NoRoute(httpLoggerMiddleware(s), httpServerHeaderMiddleware, s.onRequest)
+	router.NoRoute(s.onRequest)
+
+	network, address := restrictNetwork("tcp", address)
 
 	var err error
-	s.inner, err = newHTTPServer(
+	s.inner, err = httpserv.NewWrappedServer(
+		network,
 		address,
-		readTimeout,
+		time.Duration(readTimeout),
 		serverCert,
 		serverKey,
 		router,
+		s,
 	)
 	if err != nil {
 		return nil, err
@@ -81,7 +94,7 @@ func (s *hlsHTTPServer) Log(level logger.Level, format string, args ...interface
 }
 
 func (s *hlsHTTPServer) close() {
-	s.inner.close()
+	s.inner.Close()
 }
 
 func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
@@ -92,7 +105,7 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 	case http.MethodOptions:
 		ctx.Writer.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET")
 		ctx.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Range")
-		ctx.Writer.WriteHeader(http.StatusOK)
+		ctx.Writer.WriteHeader(http.StatusNoContent)
 		return
 
 	case http.MethodGet:
@@ -108,6 +121,13 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 	var fname string
 
 	switch {
+	case strings.HasSuffix(pa, "/hls.min.js"):
+		ctx.Writer.Header().Set("Cache-Control", "max-age=3600")
+		ctx.Writer.Header().Set("Content-Type", "application/javascript")
+		ctx.Writer.WriteHeader(http.StatusOK)
+		ctx.Writer.Write(hlsMinJS)
+		return
+
 	case pa == "", pa == "favicon.ico":
 		return
 
@@ -142,7 +162,7 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 
 	user, pass, hasCredentials := ctx.Request.BasicAuth()
 
-	res := s.pathManager.getPathConf(pathGetPathConfReq{
+	res := s.pathManager.getConfForPath(pathGetConfForPathReq{
 		name:    dir,
 		publish: false,
 		credentials: authCredentials{
@@ -150,18 +170,26 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 			ip:    net.ParseIP(ctx.ClientIP()),
 			user:  user,
 			pass:  pass,
-			proto: authProtocolWebRTC,
+			proto: authProtocolHLS,
 		},
 	})
 	if res.err != nil {
-		if terr, ok := res.err.(pathErrAuth); ok {
+		if terr, ok := res.err.(*errAuthentication); ok {
 			if !hasCredentials {
 				ctx.Header("WWW-Authenticate", `Basic realm="mediamtx"`)
 				ctx.Writer.WriteHeader(http.StatusUnauthorized)
 				return
 			}
 
-			s.Log(logger.Info, "authentication error: %v", terr.wrapped)
+			ip := ctx.ClientIP()
+			_, port, _ := net.SplitHostPort(ctx.Request.RemoteAddr)
+			remoteAddr := net.JoinHostPort(ip, port)
+
+			s.Log(logger.Info, "connection %v failed to authenticate: %v", remoteAddr, terr.message)
+
+			// wait some seconds to stop brute force attacks
+			<-time.After(hlsPauseAfterAuthError)
+
 			ctx.Writer.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -172,6 +200,7 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 
 	switch fname {
 	case "":
+		ctx.Writer.Header().Set("Cache-Control", "max-age=3600")
 		ctx.Writer.Header().Set("Content-Type", "text/html")
 		ctx.Writer.WriteHeader(http.StatusOK)
 		ctx.Writer.Write(hlsIndex)

@@ -2,63 +2,76 @@ package formatprocessor
 
 import (
 	"bytes"
-	"fmt"
 	"testing"
-	"time"
 
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/mediacommon/pkg/codecs/h264"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
-type testLogWriter struct {
-	recv chan string
-}
-
-func (w *testLogWriter) Log(_ logger.Level, format string, args ...interface{}) {
-	w.recv <- fmt.Sprintf(format, args...)
-}
-
 func TestH264DynamicParams(t *testing.T) {
-	forma := &formats.H264{
+	forma := &format.H264{
 		PayloadTyp:        96,
 		PacketizationMode: 1,
 	}
 
-	p, err := New(1472, forma, false, nil)
+	p, err := New(1472, forma, false)
 	require.NoError(t, err)
 
-	enc, err := forma.CreateEncoder2()
+	enc, err := forma.CreateEncoder()
 	require.NoError(t, err)
 
-	pkts, err := enc.Encode([][]byte{{byte(h264.NALUTypeIDR)}}, 0)
+	pkts, err := enc.Encode([][]byte{{byte(h264.NALUTypeIDR)}})
 	require.NoError(t, err)
 
-	data := &UnitH264{RTPPackets: []*rtp.Packet{pkts[0]}}
-	p.Process(data, true)
+	data := &unit.H264{
+		Base: unit.Base{
+			RTPPackets: []*rtp.Packet{pkts[0]},
+		},
+	}
+	err = p.Process(data, true)
+	require.NoError(t, err)
 
 	require.Equal(t, [][]byte{
 		{byte(h264.NALUTypeIDR)},
 	}, data.AU)
 
-	pkts, err = enc.Encode([][]byte{{7, 4, 5, 6}}, 0) // SPS
+	pkts, err = enc.Encode([][]byte{{7, 4, 5, 6}}) // SPS
 	require.NoError(t, err)
-	p.Process(&UnitH264{RTPPackets: []*rtp.Packet{pkts[0]}}, false)
 
-	pkts, err = enc.Encode([][]byte{{8, 1}}, 0) // PPS
+	err = p.Process(&unit.H264{
+		Base: unit.Base{
+			RTPPackets: []*rtp.Packet{pkts[0]},
+		},
+	}, false)
 	require.NoError(t, err)
-	p.Process(&UnitH264{RTPPackets: []*rtp.Packet{pkts[0]}}, false)
+
+	pkts, err = enc.Encode([][]byte{{8, 1}}) // PPS
+	require.NoError(t, err)
+
+	err = p.Process(&unit.H264{
+		Base: unit.Base{
+			RTPPackets: []*rtp.Packet{pkts[0]},
+		},
+	}, false)
+	require.NoError(t, err)
 
 	require.Equal(t, []byte{7, 4, 5, 6}, forma.SPS)
 	require.Equal(t, []byte{8, 1}, forma.PPS)
 
-	pkts, err = enc.Encode([][]byte{{byte(h264.NALUTypeIDR)}}, 0)
+	pkts, err = enc.Encode([][]byte{{byte(h264.NALUTypeIDR)}})
 	require.NoError(t, err)
-	data = &UnitH264{RTPPackets: []*rtp.Packet{pkts[0]}}
-	p.Process(data, true)
+
+	data = &unit.H264{
+		Base: unit.Base{
+			RTPPackets: []*rtp.Packet{pkts[0]},
+		},
+	}
+	err = p.Process(data, true)
+	require.NoError(t, err)
 
 	require.Equal(t, [][]byte{
 		{0x07, 4, 5, 6},
@@ -68,14 +81,14 @@ func TestH264DynamicParams(t *testing.T) {
 }
 
 func TestH264OversizedPackets(t *testing.T) {
-	forma := &formats.H264{
+	forma := &format.H264{
 		PayloadTyp:        96,
 		SPS:               []byte{0x01, 0x02, 0x03, 0x04},
 		PPS:               []byte{0x01, 0x02, 0x03, 0x04},
 		PacketizationMode: 1,
 	}
 
-	p, err := New(1472, forma, false, nil)
+	p, err := New(1472, forma, false)
 	require.NoError(t, err)
 
 	var out []*rtp.Packet
@@ -118,8 +131,14 @@ func TestH264OversizedPackets(t *testing.T) {
 			Payload: []byte{0x1c, 0b01000000, 0x01, 0x02, 0x03, 0x04},
 		},
 	} {
-		data := &UnitH264{RTPPackets: []*rtp.Packet{pkt}}
-		p.Process(data, false)
+		data := &unit.H264{
+			Base: unit.Base{
+				RTPPackets: []*rtp.Packet{pkt},
+			},
+		}
+		err := p.Process(data, false)
+		require.NoError(t, err)
+
 		out = append(out, data.RTPPackets...)
 	}
 
@@ -167,55 +186,24 @@ func TestH264OversizedPackets(t *testing.T) {
 }
 
 func TestH264EmptyPacket(t *testing.T) {
-	forma := &formats.H264{
+	forma := &format.H264{
 		PayloadTyp:        96,
 		PacketizationMode: 1,
 	}
 
-	p, err := New(1472, forma, true, nil)
+	p, err := New(1472, forma, true)
 	require.NoError(t, err)
 
-	unit := &UnitH264{
+	unit := &unit.H264{
 		AU: [][]byte{
 			{0x07, 0x01, 0x02, 0x03}, // SPS
 			{0x08, 0x01, 0x02},       // PPS
 		},
 	}
 
-	p.Process(unit, false)
+	err = p.Process(unit, false)
+	require.NoError(t, err)
 
 	// if all NALUs have been removed, no RTP packets must be generated.
 	require.Equal(t, []*rtp.Packet(nil), unit.RTPPackets)
-}
-
-func TestH264KeyFrameWarning(t *testing.T) {
-	forma := &formats.H264{
-		PayloadTyp:        96,
-		PacketizationMode: 1,
-	}
-
-	w := &testLogWriter{recv: make(chan string, 1)}
-	p, err := New(1472, forma, true, w)
-	require.NoError(t, err)
-
-	ntp := time.Date(2009, time.November, 10, 23, 0, 0, 0, time.UTC)
-	err = p.Process(&UnitH264{
-		AU: [][]byte{
-			{0x01},
-		},
-		NTP: ntp,
-	}, false)
-	require.NoError(t, err)
-
-	ntp = ntp.Add(30 * time.Second)
-	err = p.Process(&UnitH264{
-		AU: [][]byte{
-			{0x01},
-		},
-		NTP: ntp,
-	}, false)
-	require.NoError(t, err)
-
-	logl := <-w.recv
-	require.Equal(t, "no H264 key frames received in 10s, stream can't be decoded", logl)
 }

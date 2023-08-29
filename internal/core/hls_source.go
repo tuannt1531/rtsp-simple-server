@@ -2,28 +2,24 @@ package core
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/tls"
-	"encoding/hex"
-	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/bluenviron/gohlslib"
 	"github.com/bluenviron/gohlslib/pkg/codecs"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/media"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
-	"github.com/bluenviron/mediamtx/internal/formatprocessor"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/stream"
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
 type hlsSourceParent interface {
 	logger.Writer
-	sourceStaticImplSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
-	sourceStaticImplSetNotReady(req pathSourceStaticSetNotReadyReq)
+	setReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
+	setNotReady(req pathSourceStaticSetNotReadyReq)
 }
 
 type hlsSource struct {
@@ -39,150 +35,180 @@ func newHLSSource(
 }
 
 func (s *hlsSource) Log(level logger.Level, format string, args ...interface{}) {
-	s.parent.Log(level, "[hls source] "+format, args...)
+	s.parent.Log(level, "[HLS source] "+format, args...)
 }
 
 // run implements sourceStaticImpl.
 func (s *hlsSource) run(ctx context.Context, cnf *conf.PathConf, reloadConf chan *conf.PathConf) error {
-	var stream *stream
+	var stream *stream.Stream
 
 	defer func() {
 		if stream != nil {
-			s.parent.sourceStaticImplSetNotReady(pathSourceStaticSetNotReadyReq{})
+			s.parent.setNotReady(pathSourceStaticSetNotReadyReq{})
 		}
 	}()
 
-	var tlsConfig *tls.Config
-	if cnf.SourceFingerprint != "" {
-		tlsConfig = &tls.Config{
-			InsecureSkipVerify: true,
-			VerifyConnection: func(cs tls.ConnectionState) error {
-				h := sha256.New()
-				h.Write(cs.PeerCertificates[0].Raw)
-				hstr := hex.EncodeToString(h.Sum(nil))
-				fingerprintLower := strings.ToLower(cnf.SourceFingerprint)
+	decodeErrLogger := newLimitedLogger(s)
 
-				if hstr != fingerprintLower {
-					return fmt.Errorf("server fingerprint do not match: expected %s, got %s",
-						fingerprintLower, hstr)
-				}
-
-				return nil
-			},
-		}
-	}
-
-	c := &gohlslib.Client{
+	var c *gohlslib.Client
+	c = &gohlslib.Client{
 		URI: cnf.Source,
 		HTTPClient: &http.Client{
 			Transport: &http.Transport{
-				TLSClientConfig: tlsConfig,
+				TLSClientConfig: tlsConfigForFingerprint(cnf.SourceFingerprint),
 			},
 		},
-		Log: func(level gohlslib.LogLevel, format string, args ...interface{}) {
-			s.Log(logger.Level(level), format, args...)
+		OnDownloadPrimaryPlaylist: func(u string) {
+			s.Log(logger.Debug, "downloading primary playlist %v", u)
 		},
-	}
+		OnDownloadStreamPlaylist: func(u string) {
+			s.Log(logger.Debug, "downloading stream playlist %v", u)
+		},
+		OnDownloadSegment: func(u string) {
+			s.Log(logger.Debug, "downloading segment %v", u)
+		},
+		OnDecodeError: func(err error) {
+			decodeErrLogger.Log(logger.Warn, err.Error())
+		},
+		OnTracks: func(tracks []*gohlslib.Track) error {
+			var medias []*description.Media
 
-	c.OnTracks(func(tracks []*gohlslib.Track) error {
-		var medias media.Medias
+			for _, track := range tracks {
+				var medi *description.Media
 
-		for _, track := range tracks {
-			var medi *media.Media
+				switch tcodec := track.Codec.(type) {
+				case *codecs.AV1:
+					medi = &description.Media{
+						Type:    description.MediaTypeVideo,
+						Formats: []format.Format{&format.AV1{}},
+					}
 
-			switch tcodec := track.Codec.(type) {
-			case *codecs.H264:
-				medi = &media.Media{
-					Type: media.TypeVideo,
-					Formats: []formats.Format{&formats.H264{
-						PayloadTyp:        96,
-						PacketizationMode: 1,
-						SPS:               tcodec.SPS,
-						PPS:               tcodec.PPS,
-					}},
+					c.OnDataAV1(track, func(pts time.Duration, tu [][]byte) {
+						stream.WriteUnit(medi, medi.Formats[0], &unit.AV1{
+							Base: unit.Base{
+								NTP: time.Now(),
+								PTS: pts,
+							},
+							TU: tu,
+						})
+					})
+
+				case *codecs.VP9:
+					medi = &description.Media{
+						Type:    description.MediaTypeVideo,
+						Formats: []format.Format{&format.VP9{}},
+					}
+
+					c.OnDataVP9(track, func(pts time.Duration, frame []byte) {
+						stream.WriteUnit(medi, medi.Formats[0], &unit.VP9{
+							Base: unit.Base{
+								NTP: time.Now(),
+								PTS: pts,
+							},
+							Frame: frame,
+						})
+					})
+
+				case *codecs.H264:
+					medi = &description.Media{
+						Type: description.MediaTypeVideo,
+						Formats: []format.Format{&format.H264{
+							PayloadTyp:        96,
+							PacketizationMode: 1,
+							SPS:               tcodec.SPS,
+							PPS:               tcodec.PPS,
+						}},
+					}
+
+					c.OnDataH26x(track, func(pts time.Duration, dts time.Duration, au [][]byte) {
+						stream.WriteUnit(medi, medi.Formats[0], &unit.H264{
+							Base: unit.Base{
+								NTP: time.Now(),
+								PTS: pts,
+							},
+							AU: au,
+						})
+					})
+
+				case *codecs.H265:
+					medi = &description.Media{
+						Type: description.MediaTypeVideo,
+						Formats: []format.Format{&format.H265{
+							PayloadTyp: 96,
+							VPS:        tcodec.VPS,
+							SPS:        tcodec.SPS,
+							PPS:        tcodec.PPS,
+						}},
+					}
+
+					c.OnDataH26x(track, func(pts time.Duration, dts time.Duration, au [][]byte) {
+						stream.WriteUnit(medi, medi.Formats[0], &unit.H265{
+							Base: unit.Base{
+								NTP: time.Now(),
+								PTS: pts,
+							},
+							AU: au,
+						})
+					})
+
+				case *codecs.MPEG4Audio:
+					medi = &description.Media{
+						Type: description.MediaTypeAudio,
+						Formats: []format.Format{&format.MPEG4Audio{
+							PayloadTyp:       96,
+							SizeLength:       13,
+							IndexLength:      3,
+							IndexDeltaLength: 3,
+							Config:           &tcodec.Config,
+						}},
+					}
+
+					c.OnDataMPEG4Audio(track, func(pts time.Duration, aus [][]byte) {
+						stream.WriteUnit(medi, medi.Formats[0], &unit.MPEG4AudioGeneric{
+							Base: unit.Base{
+								NTP: time.Now(),
+								PTS: pts,
+							},
+							AUs: aus,
+						})
+					})
+
+				case *codecs.Opus:
+					medi = &description.Media{
+						Type: description.MediaTypeAudio,
+						Formats: []format.Format{&format.Opus{
+							PayloadTyp: 96,
+							IsStereo:   (tcodec.ChannelCount == 2),
+						}},
+					}
+
+					c.OnDataOpus(track, func(pts time.Duration, packets [][]byte) {
+						stream.WriteUnit(medi, medi.Formats[0], &unit.Opus{
+							Base: unit.Base{
+								NTP: time.Now(),
+								PTS: pts,
+							},
+							Packets: packets,
+						})
+					})
 				}
 
-				c.OnData(track, func(pts time.Duration, unit interface{}) {
-					stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitH264{
-						PTS: pts,
-						AU:  unit.([][]byte),
-						NTP: time.Now(),
-					})
-				})
-
-			case *codecs.H265:
-				medi = &media.Media{
-					Type: media.TypeVideo,
-					Formats: []formats.Format{&formats.H265{
-						PayloadTyp: 96,
-						VPS:        tcodec.VPS,
-						SPS:        tcodec.SPS,
-						PPS:        tcodec.PPS,
-					}},
-				}
-
-				c.OnData(track, func(pts time.Duration, unit interface{}) {
-					stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitH265{
-						PTS: pts,
-						AU:  unit.([][]byte),
-						NTP: time.Now(),
-					})
-				})
-
-			case *codecs.MPEG4Audio:
-				medi = &media.Media{
-					Type: media.TypeAudio,
-					Formats: []formats.Format{&formats.MPEG4Audio{
-						PayloadTyp:       96,
-						SizeLength:       13,
-						IndexLength:      3,
-						IndexDeltaLength: 3,
-						Config:           &tcodec.Config,
-					}},
-				}
-
-				c.OnData(track, func(pts time.Duration, unit interface{}) {
-					stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitMPEG4AudioGeneric{
-						PTS: pts,
-						AUs: [][]byte{unit.([]byte)},
-						NTP: time.Now(),
-					})
-				})
-
-			case *codecs.Opus:
-				medi = &media.Media{
-					Type: media.TypeAudio,
-					Formats: []formats.Format{&formats.Opus{
-						PayloadTyp: 96,
-						IsStereo:   (tcodec.Channels == 2),
-					}},
-				}
-
-				c.OnData(track, func(pts time.Duration, unit interface{}) {
-					stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitOpus{
-						PTS:   pts,
-						Frame: unit.([]byte),
-						NTP:   time.Now(),
-					})
-				})
+				medias = append(medias, medi)
 			}
 
-			medias = append(medias, medi)
-		}
+			res := s.parent.setReady(pathSourceStaticSetReadyReq{
+				desc:               &description.Session{Medias: medias},
+				generateRTPPackets: true,
+			})
+			if res.err != nil {
+				return res.err
+			}
 
-		res := s.parent.sourceStaticImplSetReady(pathSourceStaticSetReadyReq{
-			medias:             medias,
-			generateRTPPackets: true,
-		})
-		if res.err != nil {
-			return res.err
-		}
+			stream = res.stream
 
-		s.Log(logger.Info, "ready: %s", sourceMediaInfo(medias))
-		stream = res.stream
-
-		return nil
-	})
+			return nil
+		},
+	}
 
 	err := c.Start()
 	if err != nil {

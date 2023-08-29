@@ -8,17 +8,30 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/asticode/go-astits"
-	"github.com/bluenviron/gortsplib/v3"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/media"
-	"github.com/bluenviron/gortsplib/v3/pkg/url"
-	"github.com/bluenviron/mediacommon/pkg/codecs/h264"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/url"
 	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
+	"github.com/bluenviron/mediacommon/pkg/formats/mpegts"
 	"github.com/gin-gonic/gin"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
+
+var track1 = &mpegts.Track{
+	Codec: &mpegts.CodecH264{},
+}
+
+var track2 = &mpegts.Track{
+	Codec: &mpegts.CodecMPEG4Audio{
+		Config: mpeg4audio.Config{
+			Type:         2,
+			SampleRate:   44100,
+			ChannelCount: 2,
+		},
+	},
+}
 
 type testHLSManager struct {
 	s *http.Server
@@ -71,130 +84,28 @@ segment2.ts
 
 func (ts *testHLSManager) onSegment1(ctx *gin.Context) {
 	ctx.Writer.Header().Set("Content-Type", `video/MP2T`)
-	mux := astits.NewMuxer(context.Background(), ctx.Writer)
 
-	mux.AddElementaryStream(astits.PMTElementaryStream{
-		ElementaryPID: 256,
-		StreamType:    astits.StreamTypeH264Video,
-	})
+	w := mpegts.NewWriter(ctx.Writer, []*mpegts.Track{track1, track2})
 
-	mux.AddElementaryStream(astits.PMTElementaryStream{
-		ElementaryPID: 257,
-		StreamType:    astits.StreamTypeAACAudio,
-	})
-
-	mux.SetPCRPID(256)
-
-	mux.WriteTables()
-
-	pkts := mpeg4audio.ADTSPackets{
-		{
-			Type:         2,
-			SampleRate:   44100,
-			ChannelCount: 2,
-			AU:           []byte{0x01, 0x02, 0x03, 0x04},
-		},
-	}
-	enc, _ := pkts.Marshal()
-
-	mux.WriteData(&astits.MuxerData{
-		PID: 257,
-		PES: &astits.PESData{
-			Header: &astits.PESHeader{
-				OptionalHeader: &astits.PESOptionalHeader{
-					MarkerBits:      2,
-					PTSDTSIndicator: astits.PTSDTSIndicatorOnlyPTS,
-					PTS:             &astits.ClockReference{Base: int64(1 * 90000)},
-				},
-				StreamID: 192,
-			},
-			Data: enc,
-		},
-	})
+	w.WriteMPEG4Audio(track2, 1*90000, [][]byte{{1, 2, 3, 4}}) //nolint:errcheck
 }
 
 func (ts *testHLSManager) onSegment2(ctx *gin.Context) {
 	<-ts.clientConnected
 
 	ctx.Writer.Header().Set("Content-Type", `video/MP2T`)
-	mux := astits.NewMuxer(context.Background(), ctx.Writer)
 
-	mux.AddElementaryStream(astits.PMTElementaryStream{
-		ElementaryPID: 256,
-		StreamType:    astits.StreamTypeH264Video,
-	})
+	w := mpegts.NewWriter(ctx.Writer, []*mpegts.Track{track1, track2})
 
-	mux.AddElementaryStream(astits.PMTElementaryStream{
-		ElementaryPID: 257,
-		StreamType:    astits.StreamTypeAACAudio,
-	})
-
-	mux.SetPCRPID(256)
-
-	mux.WriteTables()
-
-	enc, _ := h264.AnnexBMarshal([][]byte{
+	w.WriteH26x(track1, 2*90000, 2*90000, true, [][]byte{ //nolint:errcheck
 		{7, 1, 2, 3}, // SPS
 		{8},          // PPS
 	})
 
-	mux.WriteData(&astits.MuxerData{
-		PID: 256,
-		PES: &astits.PESData{
-			Header: &astits.PESHeader{
-				OptionalHeader: &astits.PESOptionalHeader{
-					MarkerBits:      2,
-					PTSDTSIndicator: astits.PTSDTSIndicatorOnlyPTS,
-					PTS:             &astits.ClockReference{Base: int64(2 * 90000)},
-				},
-				StreamID: 224, // = video
-			},
-			Data: enc,
-		},
-	})
+	w.WriteMPEG4Audio(track2, 2*90000, [][]byte{{1, 2, 3, 4}}) //nolint:errcheck
 
-	pkts := mpeg4audio.ADTSPackets{
-		{
-			Type:         2,
-			SampleRate:   44100,
-			ChannelCount: 2,
-			AU:           []byte{0x01, 0x02, 0x03, 0x04},
-		},
-	}
-	enc, _ = pkts.Marshal()
-
-	mux.WriteData(&astits.MuxerData{
-		PID: 257,
-		PES: &astits.PESData{
-			Header: &astits.PESHeader{
-				OptionalHeader: &astits.PESOptionalHeader{
-					MarkerBits:      2,
-					PTSDTSIndicator: astits.PTSDTSIndicatorOnlyPTS,
-					PTS:             &astits.ClockReference{Base: int64(1 * 90000)},
-				},
-				StreamID: 192,
-			},
-			Data: enc,
-		},
-	})
-
-	enc, _ = h264.AnnexBMarshal([][]byte{
+	w.WriteH26x(track1, 2*90000, 2*90000, true, [][]byte{ //nolint:errcheck
 		{5}, // IDR
-	})
-
-	mux.WriteData(&astits.MuxerData{
-		PID: 256,
-		PES: &astits.PESData{
-			Header: &astits.PESHeader{
-				OptionalHeader: &astits.PESOptionalHeader{
-					MarkerBits:      2,
-					PTSDTSIndicator: astits.PTSDTSIndicatorOnlyPTS,
-					PTS:             &astits.ClockReference{Base: int64(2 * 90000)},
-				},
-				StreamID: 224, // = video
-			},
-			Data: enc,
-		},
 	})
 }
 
@@ -203,9 +114,9 @@ func TestHLSSource(t *testing.T) {
 	require.NoError(t, err)
 	defer ts.close()
 
-	p, ok := newInstance("rtmpDisable: yes\n" +
-		"hlsDisable: yes\n" +
-		"webrtcDisable: yes\n" +
+	p, ok := newInstance("rtmp: no\n" +
+		"hls: no\n" +
+		"webrtc: no\n" +
 		"paths:\n" +
 		"  proxied:\n" +
 		"    source: http://localhost:5780/stream.m3u8\n" +
@@ -224,25 +135,25 @@ func TestHLSSource(t *testing.T) {
 	require.NoError(t, err)
 	defer c.Close()
 
-	medias, baseURL, _, err := c.Describe(u)
+	desc, _, err := c.Describe(u)
 	require.NoError(t, err)
 
-	require.Equal(t, media.Medias{
+	require.Equal(t, []*description.Media{
 		{
-			Type:    media.TypeVideo,
-			Control: medias[0].Control,
-			Formats: []formats.Format{
-				&formats.H264{
+			Type:    description.MediaTypeVideo,
+			Control: desc.Medias[0].Control,
+			Formats: []format.Format{
+				&format.H264{
 					PayloadTyp:        96,
 					PacketizationMode: 1,
 				},
 			},
 		},
 		{
-			Type:    media.TypeAudio,
-			Control: medias[1].Control,
-			Formats: []formats.Format{
-				&formats.MPEG4Audio{
+			Type:    description.MediaTypeAudio,
+			Control: desc.Medias[1].Control,
+			Formats: []format.Format{
+				&format.MPEG4Audio{
 					PayloadTyp:     96,
 					ProfileLevelID: 1,
 					Config: &mpeg4audio.Config{
@@ -256,12 +167,15 @@ func TestHLSSource(t *testing.T) {
 				},
 			},
 		},
-	}, medias)
+	}, desc.Medias)
 
-	err = c.SetupAll(medias, baseURL)
+	var forma *format.H264
+	medi := desc.FindFormat(&forma)
+
+	_, err = c.Setup(desc.BaseURL, medi, 0, 0)
 	require.NoError(t, err)
 
-	c.OnPacketRTP(medias[0], medias[0].Formats[0], func(pkt *rtp.Packet) {
+	c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
 		require.Equal(t, &rtp.Packet{
 			Header: rtp.Header{
 				Version:        2,

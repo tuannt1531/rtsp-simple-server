@@ -9,80 +9,75 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/media"
-	"github.com/gin-gonic/gin"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
 
 type testHTTPAuthenticator struct {
-	protocol string
-	action   string
-
-	s *http.Server
+	*http.Server
 }
 
 func newTestHTTPAuthenticator(t *testing.T, protocol string, action string) *testHTTPAuthenticator {
+	firstReceived := false
+
+	ts := &testHTTPAuthenticator{}
+
+	ts.Server = &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, http.MethodPost, r.Method)
+			require.Equal(t, "/auth", r.URL.Path)
+
+			var in struct {
+				IP       string `json:"ip"`
+				User     string `json:"user"`
+				Password string `json:"password"`
+				Path     string `json:"path"`
+				Protocol string `json:"protocol"`
+				ID       string `json:"id"`
+				Action   string `json:"action"`
+				Query    string `json:"query"`
+			}
+			err := json.NewDecoder(r.Body).Decode(&in)
+			require.NoError(t, err)
+
+			var user string
+			if action == "publish" {
+				user = "testpublisher"
+			} else {
+				user = "testreader"
+			}
+
+			if in.IP != "127.0.0.1" ||
+				in.User != user ||
+				in.Password != "testpass" ||
+				in.Path != "teststream" ||
+				in.Protocol != protocol ||
+				(firstReceived && in.ID == "") ||
+				in.Action != action ||
+				(in.Query != "user=testreader&pass=testpass&param=value" &&
+					in.Query != "user=testpublisher&pass=testpass&param=value" &&
+					in.Query != "param=value") {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			firstReceived = true
+		}),
+	}
+
 	ln, err := net.Listen("tcp", "127.0.0.1:9120")
 	require.NoError(t, err)
 
-	ts := &testHTTPAuthenticator{
-		protocol: protocol,
-		action:   action,
-	}
-
-	router := gin.New()
-	router.POST("/auth", ts.onAuth)
-
-	ts.s = &http.Server{Handler: router}
-	go ts.s.Serve(ln)
+	go ts.Server.Serve(ln)
 
 	return ts
 }
 
 func (ts *testHTTPAuthenticator) close() {
-	ts.s.Shutdown(context.Background())
-}
-
-func (ts *testHTTPAuthenticator) onAuth(ctx *gin.Context) {
-	var in struct {
-		IP       string `json:"ip"`
-		User     string `json:"user"`
-		Password string `json:"password"`
-		Path     string `json:"path"`
-		Protocol string `json:"protocol"`
-		ID       string `json:"id"`
-		Action   string `json:"action"`
-		Query    string `json:"query"`
-	}
-	err := json.NewDecoder(ctx.Request.Body).Decode(&in)
-	if err != nil {
-		ctx.AbortWithStatus(http.StatusBadRequest)
-		return
-	}
-
-	var user string
-	if ts.action == "publish" {
-		user = "testpublisher"
-	} else {
-		user = "testreader"
-	}
-
-	if in.IP != "127.0.0.1" ||
-		in.User != user ||
-		in.Password != "testpass" ||
-		in.Path != "teststream" ||
-		in.Protocol != ts.protocol ||
-		// in.ID == "" ||
-		in.Action != ts.action ||
-		(in.Query != "user=testreader&pass=testpass&param=value" &&
-			in.Query != "user=testpublisher&pass=testpass&param=value" &&
-			in.Query != "param=value") {
-		ctx.AbortWithStatus(http.StatusBadRequest)
-		return
-	}
+	ts.Server.Shutdown(context.Background())
 }
 
 func httpPullFile(t *testing.T, hc *http.Client, u string) []byte {
@@ -123,9 +118,9 @@ func TestHLSRead(t *testing.T) {
 	require.Equal(t, true, ok)
 	defer p.Close()
 
-	medi := &media.Media{
-		Type: media.TypeVideo,
-		Formats: []formats.Format{&formats.H264{
+	medi := &description.Media{
+		Type: description.MediaTypeVideo,
+		Formats: []format.Format{&format.H264{
 			PayloadTyp:        96,
 			PacketizationMode: 1,
 			SPS: []byte{ // 1920x1080 baseline
@@ -141,14 +136,15 @@ func TestHLSRead(t *testing.T) {
 	source := gortsplib.Client{
 		Transport: &v,
 	}
-	err := source.StartRecording("rtsp://localhost:8554/stream", media.Medias{medi})
+	err := source.StartRecording("rtsp://localhost:8554/stream",
+		&description.Session{Medias: []*description.Media{medi}})
 	require.NoError(t, err)
 	defer source.Close()
 
 	time.Sleep(500 * time.Millisecond)
 
 	for i := 0; i < 2; i++ {
-		source.WritePacketRTP(medi, &rtp.Packet{
+		err = source.WritePacketRTP(medi, &rtp.Packet{
 			Header: rtp.Header{
 				Version:        2,
 				Marker:         true,
@@ -161,6 +157,7 @@ func TestHLSRead(t *testing.T) {
 				0x05, 0x02, 0x03, 0x04, // IDR
 			},
 		})
+		require.NoError(t, err)
 	}
 
 	hc := &http.Client{Transport: &http.Transport{}}
@@ -170,7 +167,7 @@ func TestHLSRead(t *testing.T) {
 		"#EXT-X-VERSION:9\n"+
 		"#EXT-X-INDEPENDENT-SEGMENTS\n"+
 		"\n"+
-		"#EXT-X-STREAM-INF:BANDWIDTH=1256,AVERAGE-BANDWIDTH=1256,"+
+		"#EXT-X-STREAM-INF:BANDWIDTH=1192,AVERAGE-BANDWIDTH=1192,"+
 		"CODECS=\"avc1.42c028\",RESOLUTION=1920x1080,FRAME-RATE=30.000\n"+
 		"stream.m3u8\n", string(cnt))
 
@@ -181,7 +178,7 @@ func TestHLSRead(t *testing.T) {
 		"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=2\\.50000,CAN-SKIP-UNTIL=6\\.00000\n"+
 		"#EXT-X-PART-INF:PART-TARGET=1\\.00000\n"+
 		"#EXT-X-MEDIA-SEQUENCE:1\n"+
-		"#EXT-X-MAP:URI=\"init.mp4\"\n"+
+		"#EXT-X-MAP:URI=\".*?_init.mp4\"\n"+
 		"#EXT-X-GAP\n"+
 		"#EXTINF:1\\.00000,\n"+
 		"gap.mp4\n"+
@@ -201,10 +198,10 @@ func TestHLSRead(t *testing.T) {
 		"#EXTINF:1\\.00000,\n"+
 		"gap.mp4\n"+
 		"#EXT-X-PROGRAM-DATE-TIME:.+?Z\n"+
-		"#EXT-X-PART:DURATION=1\\.00000,URI=\"part0.mp4\",INDEPENDENT=YES\n"+
+		"#EXT-X-PART:DURATION=1\\.00000,URI=\".*?_part0.mp4\",INDEPENDENT=YES\n"+
 		"#EXTINF:1\\.00000,\n"+
-		"seg7.mp4\n"+
-		"#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part1.mp4\"\n", string(cnt))
+		".*?_seg7.mp4\n"+
+		"#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\".*?_part1.mp4\"\n", string(cnt))
 
 	/*trak := <-c.track
 

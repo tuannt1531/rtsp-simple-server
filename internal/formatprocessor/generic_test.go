@@ -3,19 +3,22 @@ package formatprocessor
 import (
 	"testing"
 
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
+
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
 func TestGenericRemovePadding(t *testing.T) {
-	forma := &formats.Generic{
+	forma := &format.Generic{
 		PayloadTyp: 96,
 		RTPMa:      "private/90000",
 	}
-	forma.Init()
+	err := forma.Init()
+	require.NoError(t, err)
 
-	p, err := New(1472, forma, false, nil)
+	p, err := New(1472, forma, false)
 	require.NoError(t, err)
 
 	pkt := &rtp.Packet{
@@ -32,8 +35,10 @@ func TestGenericRemovePadding(t *testing.T) {
 		PaddingSize: 20,
 	}
 
-	err = p.Process(&UnitGeneric{
-		RTPPackets: []*rtp.Packet{pkt},
+	err = p.Process(&unit.Generic{
+		Base: unit.Base{
+			RTPPackets: []*rtp.Packet{pkt},
+		},
 	}, false)
 	require.NoError(t, err)
 

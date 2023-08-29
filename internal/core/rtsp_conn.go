@@ -5,10 +5,10 @@ import (
 	"net"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3"
-	"github.com/bluenviron/gortsplib/v3/pkg/auth"
-	"github.com/bluenviron/gortsplib/v3/pkg/base"
-	"github.com/bluenviron/gortsplib/v3/pkg/headers"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/auth"
+	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/headers"
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
@@ -17,11 +17,13 @@ import (
 )
 
 const (
-	rtspConnPauseAfterAuthError = 2 * time.Second
+	rtspPauseAfterAuthError = 2 * time.Second
 )
 
 type rtspConnParent interface {
 	logger.Writer
+	getISTLS() bool
+	getServer() *gortsplib.Server
 }
 
 type rtspConn struct {
@@ -137,7 +139,13 @@ func (c *rtspConn) onDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx,
 	ctx.Path = ctx.Path[1:]
 
 	if c.authNonce == "" {
-		c.authNonce = auth.GenerateNonce()
+		var err error
+		c.authNonce, err = auth.GenerateNonce()
+		if err != nil {
+			return &base.Response{
+				StatusCode: base.StatusInternalServerError,
+			}, nil, err
+		}
 	}
 
 	res := c.pathManager.describe(pathDescribeReq{
@@ -155,11 +163,11 @@ func (c *rtspConn) onDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx,
 
 	if res.err != nil {
 		switch terr := res.err.(type) {
-		case pathErrAuth:
-			res, err := c.handleAuthError(terr.wrapped)
+		case *errAuthentication:
+			res, err := c.handleAuthError(terr)
 			return res, nil, err
 
-		case pathErrNoOnePublishing:
+		case errPathNoOnePublishing:
 			return &base.Response{
 				StatusCode: base.StatusNotFound,
 			}, nil, res.err
@@ -180,9 +188,16 @@ func (c *rtspConn) onDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx,
 		}, nil, nil
 	}
 
+	var stream *gortsplib.ServerStream
+	if !c.parent.getISTLS() {
+		stream = res.stream.RTSPStream(c.parent.getServer())
+	} else {
+		stream = res.stream.RTSPSStream(c.parent.getServer())
+	}
+
 	return &base.Response{
 		StatusCode: base.StatusOK,
-	}, res.stream.rtspStream, nil
+	}, stream, nil
 }
 
 func (c *rtspConn) handleAuthError(authErr error) (*base.Response, error) {
@@ -204,7 +219,7 @@ func (c *rtspConn) handleAuthError(authErr error) (*base.Response, error) {
 	}
 
 	// wait some seconds to stop brute force attacks
-	<-time.After(rtspConnPauseAfterAuthError)
+	<-time.After(rtspPauseAfterAuthError)
 
 	return &base.Response{
 		StatusCode: base.StatusUnauthorized,

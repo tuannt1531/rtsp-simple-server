@@ -4,43 +4,25 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats/rtpsimpleaudio"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtpsimpleaudio"
+	"github.com/bluenviron/mediacommon/pkg/codecs/opus"
 	"github.com/pion/rtp"
 
-	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
-
-// UnitOpus is a Opus data unit.
-type UnitOpus struct {
-	RTPPackets []*rtp.Packet
-	NTP        time.Time
-	PTS        time.Duration
-	Frame      []byte
-}
-
-// GetRTPPackets implements Unit.
-func (d *UnitOpus) GetRTPPackets() []*rtp.Packet {
-	return d.RTPPackets
-}
-
-// GetNTP implements Unit.
-func (d *UnitOpus) GetNTP() time.Time {
-	return d.NTP
-}
 
 type formatProcessorOpus struct {
 	udpMaxPayloadSize int
-	format            *formats.Opus
+	format            *format.Opus
 	encoder           *rtpsimpleaudio.Encoder
 	decoder           *rtpsimpleaudio.Decoder
 }
 
 func newOpus(
 	udpMaxPayloadSize int,
-	forma *formats.Opus,
+	forma *format.Opus,
 	generateRTPPackets bool,
-	_ logger.Writer,
 ) (*formatProcessorOpus, error) {
 	t := &formatProcessorOpus{
 		udpMaxPayloadSize: udpMaxPayloadSize,
@@ -61,13 +43,12 @@ func (t *formatProcessorOpus) createEncoder() error {
 	t.encoder = &rtpsimpleaudio.Encoder{
 		PayloadMaxSize: t.udpMaxPayloadSize - 12,
 		PayloadType:    t.format.PayloadTyp,
-		SampleRate:     48000,
 	}
 	return t.encoder.Init()
 }
 
-func (t *formatProcessorOpus) Process(unit Unit, hasNonRTSPReaders bool) error { //nolint:dupl
-	tunit := unit.(*UnitOpus)
+func (t *formatProcessorOpus) Process(u unit.Unit, hasNonRTSPReaders bool) error { //nolint:dupl
+	tunit := u.(*unit.Opus)
 
 	if tunit.RTPPackets != nil {
 		pkt := tunit.RTPPackets[0]
@@ -85,19 +66,18 @@ func (t *formatProcessorOpus) Process(unit Unit, hasNonRTSPReaders bool) error {
 		if hasNonRTSPReaders || t.decoder != nil {
 			if t.decoder == nil {
 				var err error
-				t.decoder, err = t.format.CreateDecoder2()
+				t.decoder, err = t.format.CreateDecoder()
 				if err != nil {
 					return err
 				}
 			}
 
-			frame, pts, err := t.decoder.Decode(pkt)
+			packet, err := t.decoder.Decode(pkt)
 			if err != nil {
 				return err
 			}
 
-			tunit.Frame = frame
-			tunit.PTS = pts
+			tunit.Packets = [][]byte{packet}
 		}
 
 		// route packet as is
@@ -105,18 +85,29 @@ func (t *formatProcessorOpus) Process(unit Unit, hasNonRTSPReaders bool) error {
 	}
 
 	// encode into RTP
-	pkt, err := t.encoder.Encode(tunit.Frame, tunit.PTS)
-	if err != nil {
-		return err
+	var rtpPackets []*rtp.Packet //nolint:prealloc
+	pts := tunit.PTS
+	for _, packet := range tunit.Packets {
+		pkt, err := t.encoder.Encode(packet)
+		if err != nil {
+			return err
+		}
+		setTimestamp([]*rtp.Packet{pkt}, tunit.RTPPackets, t.format.ClockRate(), pts)
+		rtpPackets = append(rtpPackets, pkt)
+		pts += opus.PacketDuration(packet)
 	}
-	tunit.RTPPackets = []*rtp.Packet{pkt}
+
+	tunit.RTPPackets = rtpPackets
 
 	return nil
 }
 
-func (t *formatProcessorOpus) UnitForRTPPacket(pkt *rtp.Packet, ntp time.Time) Unit {
-	return &UnitOpus{
-		RTPPackets: []*rtp.Packet{pkt},
-		NTP:        ntp,
+func (t *formatProcessorOpus) UnitForRTPPacket(pkt *rtp.Packet, ntp time.Time, pts time.Duration) Unit {
+	return &unit.Opus{
+		Base: unit.Base{
+			RTPPackets: []*rtp.Packet{pkt},
+			NTP:        ntp,
+			PTS:        pts,
+		},
 	}
 }

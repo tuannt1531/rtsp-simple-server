@@ -27,12 +27,12 @@ var readWriterCases = []struct {
 		},
 	},
 	{
-		"audio mpeg2",
+		"audio mpeg1",
 		&Audio{
 			ChunkStreamID:   7,
 			DTS:             6013806 * time.Millisecond,
 			MessageStreamID: 4534543,
-			Codec:           CodecMPEG2Audio,
+			Codec:           CodecMPEG1Audio,
 			Rate:            flvio.SOUND_44Khz,
 			Depth:           flvio.SOUND_16BIT,
 			Channels:        flvio.SOUND_STEREO,
@@ -233,6 +233,20 @@ var readWriterCases = []struct {
 		},
 	},
 	{
+		"extended sequence start",
+		&ExtendedSequenceStart{
+			ChunkStreamID:   4,
+			MessageStreamID: 0x1000000,
+			FourCC:          FourCCHEVC,
+			Config:          []byte{0x01, 0x02, 0x03},
+		},
+		[]byte{
+			0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x09,
+			0x01, 0x00, 0x00, 0x00, 0x80, 0x68, 0x76, 0x63,
+			0x31, 0x01, 0x02, 0x03,
+		},
+	},
+	{
 		"extended coded frames",
 		&ExtendedCodedFrames{
 			ChunkStreamID:   4,
@@ -268,10 +282,24 @@ var readWriterCases = []struct {
 func TestReader(t *testing.T) {
 	for _, ca := range readWriterCases {
 		t.Run(ca.name, func(t *testing.T) {
-			r := NewReader(bytecounter.NewReader(bytes.NewReader(ca.enc)), nil)
+			bc := bytecounter.NewReader(bytes.NewReader(ca.enc))
+			r := NewReader(bc, bc, nil)
 			dec, err := r.Read()
 			require.NoError(t, err)
 			require.Equal(t, ca.dec, dec)
 		})
 	}
+}
+
+func FuzzReader(f *testing.F) {
+	f.Add([]byte{
+		0x04, 0x00, 0x3a, 0xfc, 0x00, 0x00, 0x08, 0x09,
+		0x01, 0x00, 0x00, 0x00, 0x88, 0x68, 0x76, 0x63,
+		0x31, 0x01, 0x02, 0x03,
+	})
+	f.Fuzz(func(t *testing.T, b []byte) {
+		bc := bytecounter.NewReader(bytes.NewReader(b))
+		r := NewReader(bc, bc, nil)
+		r.Read() //nolint:errcheck
+	})
 }

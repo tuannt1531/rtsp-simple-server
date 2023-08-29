@@ -7,13 +7,11 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
 	"github.com/notedit/rtmp/format/flv/flvio"
 
 	"github.com/bluenviron/mediamtx/internal/rtmp/bytecounter"
 	"github.com/bluenviron/mediamtx/internal/rtmp/handshake"
 	"github.com/bluenviron/mediamtx/internal/rtmp/message"
-	"github.com/bluenviron/mediamtx/internal/rtmp/tracks"
 )
 
 func resultIsOK1(res *message.CommandAMF0) bool {
@@ -98,32 +96,9 @@ func createURL(tcURL string, app string, play string) (*url.URL, error) {
 	return u, nil
 }
 
-// Conn is a RTMP connection.
-type Conn struct {
-	bc  *bytecounter.ReadWriter
-	mrw *message.ReadWriter
-}
-
-// NewConn initializes a connection.
-func NewConn(rw io.ReadWriter) *Conn {
-	return &Conn{
-		bc: bytecounter.NewReadWriter(rw),
-	}
-}
-
-// BytesReceived returns the number of bytes received.
-func (c *Conn) BytesReceived() uint64 {
-	return c.bc.Reader.Count()
-}
-
-// BytesSent returns the number of bytes sent.
-func (c *Conn) BytesSent() uint64 {
-	return c.bc.Writer.Count()
-}
-
-func (c *Conn) readCommand() (*message.CommandAMF0, error) {
+func readCommand(mrw *message.ReadWriter) (*message.CommandAMF0, error) {
 	for {
-		msg, err := c.mrw.Read()
+		msg, err := mrw.Read()
 		if err != nil {
 			return nil, err
 		}
@@ -134,9 +109,14 @@ func (c *Conn) readCommand() (*message.CommandAMF0, error) {
 	}
 }
 
-func (c *Conn) readCommandResult(commandID int, commandName string, isValid func(*message.CommandAMF0) bool) error {
+func readCommandResult(
+	mrw *message.ReadWriter,
+	commandID int,
+	commandName string,
+	isValid func(*message.CommandAMF0) bool,
+) error {
 	for {
-		msg, err := c.mrw.Read()
+		msg, err := mrw.Read()
 		if err != nil {
 			return err
 		}
@@ -153,16 +133,35 @@ func (c *Conn) readCommandResult(commandID int, commandName string, isValid func
 	}
 }
 
-// InitializeClient performs the initialization of a client-side connection.
-func (c *Conn) InitializeClient(u *url.URL, isPublishing bool) error {
+// Conn is a RTMP connection.
+type Conn struct {
+	bc  *bytecounter.ReadWriter
+	mrw *message.ReadWriter
+}
+
+// NewClientConn initializes a client-side connection.
+func NewClientConn(rw io.ReadWriter, u *url.URL, publish bool) (*Conn, error) {
+	c := &Conn{
+		bc: bytecounter.NewReadWriter(rw),
+	}
+
+	err := c.initializeClient(u, publish)
+	if err != nil {
+		return nil, err
+	}
+
+	return c, nil
+}
+
+func (c *Conn) initializeClient(u *url.URL, publish bool) error {
 	connectpath, actionpath := splitPath(u)
 
-	err := handshake.DoClient(c.bc, false)
+	_, _, err := handshake.DoClient(c.bc, false, false)
 	if err != nil {
 		return err
 	}
 
-	c.mrw = message.NewReadWriter(c.bc, false)
+	c.mrw = message.NewReadWriter(c.bc, c.bc, false)
 
 	err = c.mrw.Write(&message.SetWindowAckSize{
 		Value: 2500000,
@@ -207,12 +206,12 @@ func (c *Conn) InitializeClient(u *url.URL, isPublishing bool) error {
 		return err
 	}
 
-	err = c.readCommandResult(1, "_result", resultIsOK1)
+	err = readCommandResult(c.mrw, 1, "_result", resultIsOK1)
 	if err != nil {
 		return err
 	}
 
-	if !isPublishing {
+	if !publish {
 		err = c.mrw.Write(&message.CommandAMF0{
 			ChunkStreamID: 3,
 			Name:          "createStream",
@@ -225,7 +224,7 @@ func (c *Conn) InitializeClient(u *url.URL, isPublishing bool) error {
 			return err
 		}
 
-		err = c.readCommandResult(2, "_result", resultIsOK2)
+		err = readCommandResult(c.mrw, 2, "_result", resultIsOK2)
 		if err != nil {
 			return err
 		}
@@ -251,7 +250,7 @@ func (c *Conn) InitializeClient(u *url.URL, isPublishing bool) error {
 			return err
 		}
 
-		return c.readCommandResult(3, "onStatus", resultIsOK1)
+		return readCommandResult(c.mrw, 3, "onStatus", resultIsOK1)
 	}
 
 	err = c.mrw.Write(&message.CommandAMF0{
@@ -292,7 +291,7 @@ func (c *Conn) InitializeClient(u *url.URL, isPublishing bool) error {
 		return err
 	}
 
-	err = c.readCommandResult(4, "_result", resultIsOK2)
+	err = readCommandResult(c.mrw, 4, "_result", resultIsOK2)
 	if err != nil {
 		return err
 	}
@@ -312,19 +311,43 @@ func (c *Conn) InitializeClient(u *url.URL, isPublishing bool) error {
 		return err
 	}
 
-	return c.readCommandResult(5, "onStatus", resultIsOK1)
+	return readCommandResult(c.mrw, 5, "onStatus", resultIsOK1)
 }
 
-// InitializeServer performs the initialization of a server-side connection.
-func (c *Conn) InitializeServer() (*url.URL, bool, error) {
-	err := handshake.DoServer(c.bc, false)
+// NewServerConn initializes a server-side connection.
+func NewServerConn(rw io.ReadWriter) (*Conn, *url.URL, bool, error) {
+	c := &Conn{
+		bc: bytecounter.NewReadWriter(rw),
+	}
+
+	u, publish, err := c.initializeServer()
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	return c, u, publish, nil
+}
+
+func (c *Conn) initializeServer() (*url.URL, bool, error) {
+	keyIn, keyOut, err := handshake.DoServer(c.bc, false)
 	if err != nil {
 		return nil, false, err
 	}
 
-	c.mrw = message.NewReadWriter(c.bc, false)
+	var rw io.ReadWriter
+	if keyIn != nil {
+		var err error
+		rw, err = newRC4ReadWriter(c.bc, keyIn, keyOut)
+		if err != nil {
+			return nil, false, err
+		}
+	} else {
+		rw = c.bc
+	}
 
-	cmd, err := c.readCommand()
+	c.mrw = message.NewReadWriter(rw, c.bc, false)
+
+	cmd, err := readCommand(c.mrw)
 	if err != nil {
 		return nil, false, err
 	}
@@ -403,7 +426,7 @@ func (c *Conn) InitializeServer() (*url.URL, bool, error) {
 	}
 
 	for {
-		cmd, err := c.readCommand()
+		cmd, err := readCommand(c.mrw)
 		if err != nil {
 			return nil, false, err
 		}
@@ -564,23 +587,32 @@ func (c *Conn) InitializeServer() (*url.URL, bool, error) {
 	}
 }
 
-// ReadMessage reads a message.
-func (c *Conn) ReadMessage() (message.Message, error) {
+func newNoHandshakeConn(rw io.ReadWriter) *Conn {
+	c := &Conn{
+		bc: bytecounter.NewReadWriter(rw),
+	}
+
+	c.mrw = message.NewReadWriter(c.bc, c.bc, false)
+
+	return c
+}
+
+// BytesReceived returns the number of bytes received.
+func (c *Conn) BytesReceived() uint64 {
+	return c.bc.Reader.Count()
+}
+
+// BytesSent returns the number of bytes sent.
+func (c *Conn) BytesSent() uint64 {
+	return c.bc.Writer.Count()
+}
+
+// Read reads a message.
+func (c *Conn) Read() (message.Message, error) {
 	return c.mrw.Read()
 }
 
-// WriteMessage writes a message.
-func (c *Conn) WriteMessage(msg message.Message) error {
+// Write writes a message.
+func (c *Conn) Write(msg message.Message) error {
 	return c.mrw.Write(msg)
-}
-
-// ReadTracks reads track informations.
-// It returns the video track and the audio track.
-func (c *Conn) ReadTracks() (formats.Format, formats.Format, error) {
-	return tracks.Read(c.mrw)
-}
-
-// WriteTracks writes track informations.
-func (c *Conn) WriteTracks(videoTrack formats.Format, audioTrack formats.Format) error {
-	return tracks.Write(c.mrw, videoTrack, audioTrack)
 }

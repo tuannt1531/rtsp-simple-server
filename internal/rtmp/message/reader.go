@@ -2,6 +2,7 @@ package message
 
 import (
 	"fmt"
+	"io"
 
 	"github.com/bluenviron/mediamtx/internal/rtmp/bytecounter"
 	"github.com/bluenviron/mediamtx/internal/rtmp/rawmessage"
@@ -69,8 +70,7 @@ func allocateMessage(raw *rawmessage.Message) (Message, error) {
 		}
 
 		if (raw.Body[0] & 0b10000000) != 0 {
-			var fourCC [4]byte
-			copy(fourCC[:], raw.Body[1:5])
+			fourCC := FourCC(raw.Body[1])<<24 | FourCC(raw.Body[2])<<16 | FourCC(raw.Body[3])<<8 | FourCC(raw.Body[4])
 
 			switch fourCC {
 			case FourCCAV1, FourCCVP9, FourCCHEVC:
@@ -116,9 +116,13 @@ type Reader struct {
 }
 
 // NewReader allocates a Reader.
-func NewReader(r *bytecounter.Reader, onAckNeeded func(uint32) error) *Reader {
+func NewReader(
+	r io.Reader,
+	bcr *bytecounter.Reader,
+	onAckNeeded func(uint32) error,
+) *Reader {
 	return &Reader{
-		r: rawmessage.NewReader(r, onAckNeeded),
+		r: rawmessage.NewReader(r, bcr, onAckNeeded),
 	}
 }
 
@@ -141,7 +145,10 @@ func (r *Reader) Read() (Message, error) {
 
 	switch tmsg := msg.(type) {
 	case *SetChunkSize:
-		r.r.SetChunkSize(tmsg.Value)
+		err := r.r.SetChunkSize(tmsg.Value)
+		if err != nil {
+			return nil, err
+		}
 
 	case *SetWindowAckSize:
 		r.r.SetWindowAckSize(tmsg.Value)

@@ -6,60 +6,21 @@ import (
 	"net"
 	"time"
 
-	"github.com/asticode/go-astits"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/media"
-	"github.com/bluenviron/mediacommon/pkg/codecs/h264"
-	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/mediacommon/pkg/formats/mpegts"
 	"golang.org/x/net/ipv4"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
-	"github.com/bluenviron/mediamtx/internal/formatprocessor"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/stream"
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
 const (
 	multicastTTL = 16
 	udpMTU       = 1472
 )
-
-var opusDurations = [32]int{
-	480, 960, 1920, 2880, /* Silk NB */
-	480, 960, 1920, 2880, /* Silk MB */
-	480, 960, 1920, 2880, /* Silk WB */
-	480, 960, /* Hybrid SWB */
-	480, 960, /* Hybrid FB */
-	120, 240, 480, 960, /* CELT NB */
-	120, 240, 480, 960, /* CELT NB */
-	120, 240, 480, 960, /* CELT NB */
-	120, 240, 480, 960, /* CELT NB */
-}
-
-func opusGetPacketDuration(pkt []byte) time.Duration {
-	if len(pkt) == 0 {
-		return 0
-	}
-
-	frameDuration := opusDurations[pkt[0]>>3]
-
-	frameCount := 0
-	switch pkt[0] & 3 {
-	case 0:
-		frameCount = 1
-	case 1:
-		frameCount = 2
-	case 2:
-		frameCount = 2
-	case 3:
-		if len(pkt) < 2 {
-			return 0
-		}
-		frameCount = int(pkt[1] & 63)
-	}
-
-	return (time.Duration(frameDuration) * time.Duration(frameCount) * time.Millisecond) / 48
-}
 
 func joinMulticastGroupOnAtLeastOneInterface(p *ipv4.PacketConn, listenIP net.IP) error {
 	intfs, err := net.Interfaces()
@@ -86,44 +47,24 @@ func joinMulticastGroupOnAtLeastOneInterface(p *ipv4.PacketConn, listenIP net.IP
 }
 
 type packetConnReader struct {
-	pc        net.PacketConn
-	midbuf    []byte
-	midbufpos int
+	net.PacketConn
 }
 
 func newPacketConnReader(pc net.PacketConn) *packetConnReader {
 	return &packetConnReader{
-		pc:     pc,
-		midbuf: make([]byte, 0, 1500),
+		PacketConn: pc,
 	}
 }
 
 func (r *packetConnReader) Read(p []byte) (int, error) {
-	if r.midbufpos < len(r.midbuf) {
-		n := copy(p, r.midbuf[r.midbufpos:])
-		r.midbufpos += n
-		return n, nil
-	}
-
-	mn, _, err := r.pc.ReadFrom(r.midbuf[:cap(r.midbuf)])
-	if err != nil {
-		return 0, err
-	}
-
-	if (mn % 188) != 0 {
-		return 0, fmt.Errorf("received packet with size %d not multiple of 188", mn)
-	}
-
-	r.midbuf = r.midbuf[:mn]
-	n := copy(p, r.midbuf)
-	r.midbufpos = n
-	return n, nil
+	n, _, err := r.PacketConn.ReadFrom(p)
+	return n, err
 }
 
 type udpSourceParent interface {
 	logger.Writer
-	sourceStaticImplSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
-	sourceStaticImplSetNotReady(req pathSourceStaticSetNotReadyReq)
+	setReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
+	setNotReady(req pathSourceStaticSetNotReadyReq)
 }
 
 type udpSource struct {
@@ -142,7 +83,7 @@ func newUDPSource(
 }
 
 func (s *udpSource) Log(level logger.Level, format string, args ...interface{}) {
-	s.parent.Log(level, "[udp source] "+format, args...)
+	s.parent.Log(level, "[UDP source] "+format, args...)
 }
 
 // run implements sourceStaticImpl.
@@ -151,16 +92,18 @@ func (s *udpSource) run(ctx context.Context, cnf *conf.PathConf, _ chan *conf.Pa
 
 	hostPort := cnf.Source[len("udp://"):]
 
-	pc, err := net.ListenPacket(restrictNetwork("udp", hostPort))
+	addr, err := net.ResolveUDPAddr("udp", hostPort)
+	if err != nil {
+		return err
+	}
+
+	pc, err := net.ListenPacket(restrictNetwork("udp", addr.String()))
 	if err != nil {
 		return err
 	}
 	defer pc.Close()
 
-	host, _, _ := net.SplitHostPort(hostPort)
-	ip := net.ParseIP(host)
-
-	if ip.IsMulticast() {
+	if addr.IP.IsMulticast() {
 		p := ipv4.NewPacketConn(pc)
 
 		err = p.SetMulticastTTL(multicastTTL)
@@ -168,199 +111,15 @@ func (s *udpSource) run(ctx context.Context, cnf *conf.PathConf, _ chan *conf.Pa
 			return err
 		}
 
-		err = joinMulticastGroupOnAtLeastOneInterface(p, ip)
+		err = joinMulticastGroupOnAtLeastOneInterface(p, addr.IP)
 		if err != nil {
 			return err
 		}
 	}
 
-	dem := astits.NewDemuxer(
-		context.Background(),
-		newPacketConnReader(pc),
-		astits.DemuxerOptPacketSize(188))
-
 	readerErr := make(chan error)
-
 	go func() {
-		readerErr <- func() error {
-			pc.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
-			tracks, err := mpegts.FindTracks(dem)
-			if err != nil {
-				return err
-			}
-
-			var medias media.Medias
-			mediaCallbacks := make(map[uint16]func(time.Duration, []byte), len(tracks))
-			var stream *stream
-
-			for _, track := range tracks {
-				var medi *media.Media
-
-				switch tcodec := track.Codec.(type) {
-				case *mpegts.CodecH264:
-					medi = &media.Media{
-						Type: media.TypeVideo,
-						Formats: []formats.Format{&formats.H264{
-							PayloadTyp:        96,
-							PacketizationMode: 1,
-						}},
-					}
-
-					mediaCallbacks[track.ES.ElementaryPID] = func(pts time.Duration, data []byte) {
-						au, err := h264.AnnexBUnmarshal(data)
-						if err != nil {
-							s.Log(logger.Warn, "%v", err)
-							return
-						}
-
-						stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitH264{
-							PTS: pts,
-							AU:  au,
-							NTP: time.Now(),
-						})
-					}
-
-				case *mpegts.CodecH265:
-					medi = &media.Media{
-						Type: media.TypeVideo,
-						Formats: []formats.Format{&formats.H265{
-							PayloadTyp: 96,
-						}},
-					}
-
-					mediaCallbacks[track.ES.ElementaryPID] = func(pts time.Duration, data []byte) {
-						au, err := h264.AnnexBUnmarshal(data)
-						if err != nil {
-							s.Log(logger.Warn, "%v", err)
-							return
-						}
-
-						stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitH265{
-							PTS: pts,
-							AU:  au,
-							NTP: time.Now(),
-						})
-					}
-
-				case *mpegts.CodecMPEG4Audio:
-					medi = &media.Media{
-						Type: media.TypeAudio,
-						Formats: []formats.Format{&formats.MPEG4Audio{
-							PayloadTyp:       96,
-							SizeLength:       13,
-							IndexLength:      3,
-							IndexDeltaLength: 3,
-							Config:           &tcodec.Config,
-						}},
-					}
-
-					mediaCallbacks[track.ES.ElementaryPID] = func(pts time.Duration, data []byte) {
-						var pkts mpeg4audio.ADTSPackets
-						err := pkts.Unmarshal(data)
-						if err != nil {
-							s.Log(logger.Warn, "%v", err)
-							return
-						}
-
-						aus := make([][]byte, len(pkts))
-						for i, pkt := range pkts {
-							aus[i] = pkt.AU
-						}
-
-						stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitMPEG4AudioGeneric{
-							PTS: pts,
-							AUs: aus,
-							NTP: time.Now(),
-						})
-					}
-
-				case *mpegts.CodecOpus:
-					medi = &media.Media{
-						Type: media.TypeAudio,
-						Formats: []formats.Format{&formats.Opus{
-							PayloadTyp: 96,
-							IsStereo:   (tcodec.Channels == 2),
-						}},
-					}
-
-					mediaCallbacks[track.ES.ElementaryPID] = func(pts time.Duration, data []byte) {
-						pos := 0
-
-						for {
-							var au mpegts.OpusAccessUnit
-							n, err := au.Unmarshal(data[pos:])
-							if err != nil {
-								s.Log(logger.Warn, "%v", err)
-								return
-							}
-							pos += n
-
-							stream.writeUnit(medi, medi.Formats[0], &formatprocessor.UnitOpus{
-								PTS:   pts,
-								Frame: au.Frame,
-								NTP:   time.Now(),
-							})
-
-							if len(data[pos:]) == 0 {
-								break
-							}
-
-							pts += opusGetPacketDuration(au.Frame)
-						}
-					}
-				}
-
-				medias = append(medias, medi)
-			}
-
-			res := s.parent.sourceStaticImplSetReady(pathSourceStaticSetReadyReq{
-				medias:             medias,
-				generateRTPPackets: true,
-			})
-			if res.err != nil {
-				return res.err
-			}
-
-			defer s.parent.sourceStaticImplSetNotReady(pathSourceStaticSetNotReadyReq{})
-
-			s.Log(logger.Info, "ready: %s", sourceMediaInfo(medias))
-
-			stream = res.stream
-			var timedec *mpegts.TimeDecoder
-
-			for {
-				pc.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
-				data, err := dem.NextData()
-				if err != nil {
-					return err
-				}
-
-				if data.PES == nil {
-					continue
-				}
-
-				if data.PES.Header.OptionalHeader == nil ||
-					data.PES.Header.OptionalHeader.PTSDTSIndicator == astits.PTSDTSIndicatorNoPTSOrDTS ||
-					data.PES.Header.OptionalHeader.PTSDTSIndicator == astits.PTSDTSIndicatorIsForbidden {
-					return fmt.Errorf("PTS is missing")
-				}
-
-				var pts time.Duration
-				if timedec == nil {
-					timedec = mpegts.NewTimeDecoder(data.PES.Header.OptionalHeader.PTS.Base)
-					pts = 0
-				} else {
-					pts = timedec.Decode(data.PES.Header.OptionalHeader.PTS.Base)
-				}
-
-				cb, ok := mediaCallbacks[data.PID]
-				if !ok {
-					continue
-				}
-
-				cb(pts, data.PES.Data)
-			}
-		}()
+		readerErr <- s.runReader(pc)
 	}()
 
 	select {
@@ -371,6 +130,165 @@ func (s *udpSource) run(ctx context.Context, cnf *conf.PathConf, _ chan *conf.Pa
 		pc.Close()
 		<-readerErr
 		return fmt.Errorf("terminated")
+	}
+}
+
+func (s *udpSource) runReader(pc net.PacketConn) error {
+	pc.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
+	r, err := mpegts.NewReader(mpegts.NewBufferedReader(newPacketConnReader(pc)))
+	if err != nil {
+		return err
+	}
+
+	decodeErrLogger := newLimitedLogger(s)
+
+	r.OnDecodeError(func(err error) {
+		decodeErrLogger.Log(logger.Warn, err.Error())
+	})
+
+	var medias []*description.Media //nolint:prealloc
+	var stream *stream.Stream
+
+	var td *mpegts.TimeDecoder
+	decodeTime := func(t int64) time.Duration {
+		if td == nil {
+			td = mpegts.NewTimeDecoder(t)
+		}
+		return td.Decode(t)
+	}
+
+	for _, track := range r.Tracks() { //nolint:dupl
+		var medi *description.Media
+
+		switch tcodec := track.Codec.(type) {
+		case *mpegts.CodecH264:
+			medi = &description.Media{
+				Type: description.MediaTypeVideo,
+				Formats: []format.Format{&format.H264{
+					PayloadTyp:        96,
+					PacketizationMode: 1,
+				}},
+			}
+
+			r.OnDataH26x(track, func(pts int64, _ int64, au [][]byte) error {
+				stream.WriteUnit(medi, medi.Formats[0], &unit.H264{
+					Base: unit.Base{
+						NTP: time.Now(),
+						PTS: decodeTime(pts),
+					},
+					AU: au,
+				})
+				return nil
+			})
+
+		case *mpegts.CodecH265:
+			medi = &description.Media{
+				Type: description.MediaTypeVideo,
+				Formats: []format.Format{&format.H265{
+					PayloadTyp: 96,
+				}},
+			}
+
+			r.OnDataH26x(track, func(pts int64, _ int64, au [][]byte) error {
+				stream.WriteUnit(medi, medi.Formats[0], &unit.H265{
+					Base: unit.Base{
+						NTP: time.Now(),
+						PTS: decodeTime(pts),
+					},
+					AU: au,
+				})
+				return nil
+			})
+
+		case *mpegts.CodecMPEG4Audio:
+			medi = &description.Media{
+				Type: description.MediaTypeAudio,
+				Formats: []format.Format{&format.MPEG4Audio{
+					PayloadTyp:       96,
+					SizeLength:       13,
+					IndexLength:      3,
+					IndexDeltaLength: 3,
+					Config:           &tcodec.Config,
+				}},
+			}
+
+			r.OnDataMPEG4Audio(track, func(pts int64, aus [][]byte) error {
+				stream.WriteUnit(medi, medi.Formats[0], &unit.MPEG4AudioGeneric{
+					Base: unit.Base{
+						NTP: time.Now(),
+						PTS: decodeTime(pts),
+					},
+					AUs: aus,
+				})
+				return nil
+			})
+
+		case *mpegts.CodecOpus:
+			medi = &description.Media{
+				Type: description.MediaTypeAudio,
+				Formats: []format.Format{&format.Opus{
+					PayloadTyp: 96,
+					IsStereo:   (tcodec.ChannelCount == 2),
+				}},
+			}
+
+			r.OnDataOpus(track, func(pts int64, packets [][]byte) error {
+				stream.WriteUnit(medi, medi.Formats[0], &unit.Opus{
+					Base: unit.Base{
+						NTP: time.Now(),
+						PTS: decodeTime(pts),
+					},
+					Packets: packets,
+				})
+				return nil
+			})
+
+		case *mpegts.CodecMPEG1Audio:
+			medi = &description.Media{
+				Type:    description.MediaTypeAudio,
+				Formats: []format.Format{&format.MPEG1Audio{}},
+			}
+
+			r.OnDataMPEG1Audio(track, func(pts int64, frames [][]byte) error {
+				stream.WriteUnit(medi, medi.Formats[0], &unit.MPEG1Audio{
+					Base: unit.Base{
+						NTP: time.Now(),
+						PTS: decodeTime(pts),
+					},
+					Frames: frames,
+				})
+				return nil
+			})
+
+		default:
+			continue
+		}
+
+		medias = append(medias, medi)
+	}
+
+	if len(medias) == 0 {
+		return fmt.Errorf("no supported tracks found")
+	}
+
+	res := s.parent.setReady(pathSourceStaticSetReadyReq{
+		desc:               &description.Session{Medias: medias},
+		generateRTPPackets: true,
+	})
+	if res.err != nil {
+		return res.err
+	}
+
+	defer s.parent.setNotReady(pathSourceStaticSetNotReadyReq{})
+
+	stream = res.stream
+
+	for {
+		pc.SetReadDeadline(time.Now().Add(time.Duration(s.readTimeout)))
+		err := r.Read()
+		if err != nil {
+			return err
+		}
 	}
 }
 

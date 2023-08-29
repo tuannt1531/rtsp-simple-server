@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/httpserv"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
@@ -23,7 +25,7 @@ type metricsParent interface {
 type metrics struct {
 	parent metricsParent
 
-	httpServer    *httpServer
+	httpServer    *httpserv.WrappedServer
 	mutex         sync.Mutex
 	pathManager   apiPathManager
 	rtspServer    apiRTSPServer
@@ -43,19 +45,21 @@ func newMetrics(
 	}
 
 	router := gin.New()
-	router.SetTrustedProxies(nil)
+	router.SetTrustedProxies(nil) //nolint:errcheck
 
-	mwLog := httpLoggerMiddleware(m)
-	router.NoRoute(mwLog)
-	router.GET("/metrics", mwLog, m.onMetrics)
+	router.GET("/metrics", m.onMetrics)
+
+	network, address := restrictNetwork("tcp", address)
 
 	var err error
-	m.httpServer, err = newHTTPServer(
+	m.httpServer, err = httpserv.NewWrappedServer(
+		network,
 		address,
-		readTimeout,
+		time.Duration(readTimeout),
 		"",
 		"",
 		router,
+		m,
 	)
 	if err != nil {
 		return nil, err
@@ -68,7 +72,7 @@ func newMetrics(
 
 func (m *metrics) close() {
 	m.Log(logger.Info, "listener is closing")
-	m.httpServer.close()
+	m.httpServer.Close()
 }
 
 func (m *metrics) Log(level logger.Level, format string, args ...interface{}) {
@@ -131,7 +135,7 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 			data, err := m.rtspServer.apiSessionsList()
 			if err == nil && len(data.Items) != 0 {
 				for _, i := range data.Items {
-					tags := "{id=\"" + i.ID.String() + "\",state=\"" + i.State + "\"}"
+					tags := "{id=\"" + i.ID.String() + "\",state=\"" + string(i.State) + "\"}"
 					out += metric("rtsp_sessions", tags, 1)
 					out += metric("rtsp_sessions_bytes_received", tags, int64(i.BytesReceived))
 					out += metric("rtsp_sessions_bytes_sent", tags, int64(i.BytesSent))
@@ -165,7 +169,7 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 			data, err := m.rtspsServer.apiSessionsList()
 			if err == nil && len(data.Items) != 0 {
 				for _, i := range data.Items {
-					tags := "{id=\"" + i.ID.String() + "\",state=\"" + i.State + "\"}"
+					tags := "{id=\"" + i.ID.String() + "\",state=\"" + string(i.State) + "\"}"
 					out += metric("rtsps_sessions", tags, 1)
 					out += metric("rtsps_sessions_bytes_received", tags, int64(i.BytesReceived))
 					out += metric("rtsps_sessions_bytes_sent", tags, int64(i.BytesSent))
@@ -182,7 +186,7 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 		data, err := m.rtmpServer.apiConnsList()
 		if err == nil && len(data.Items) != 0 {
 			for _, i := range data.Items {
-				tags := "{id=\"" + i.ID.String() + "\",state=\"" + i.State + "\"}"
+				tags := "{id=\"" + i.ID.String() + "\",state=\"" + string(i.State) + "\"}"
 				out += metric("rtmp_conns", tags, 1)
 				out += metric("rtmp_conns_bytes_received", tags, int64(i.BytesReceived))
 				out += metric("rtmp_conns_bytes_sent", tags, int64(i.BytesSent))
@@ -211,7 +215,7 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 	}
 
 	ctx.Writer.WriteHeader(http.StatusOK)
-	io.WriteString(ctx.Writer, out)
+	io.WriteString(ctx.Writer, out) //nolint:errcheck
 }
 
 // pathManagerSet is called by pathManager.
@@ -221,22 +225,22 @@ func (m *metrics) pathManagerSet(s apiPathManager) {
 	m.pathManager = s
 }
 
-// hlsManagerSet is called by hlsManager.
-func (m *metrics) hlsManagerSet(s apiHLSManager) {
+// setHLSManager is called by hlsManager.
+func (m *metrics) setHLSManager(s apiHLSManager) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.hlsManager = s
 }
 
-// rtspServerSet is called by rtspServer (plain).
-func (m *metrics) rtspServerSet(s apiRTSPServer) {
+// setRTSPServer is called by rtspServer (plain).
+func (m *metrics) setRTSPServer(s apiRTSPServer) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.rtspServer = s
 }
 
-// rtspsServerSet is called by rtspServer (tls).
-func (m *metrics) rtspsServerSet(s apiRTSPServer) {
+// setRTSPSServer is called by rtspServer (tls).
+func (m *metrics) setRTSPSServer(s apiRTSPServer) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.rtspsServer = s

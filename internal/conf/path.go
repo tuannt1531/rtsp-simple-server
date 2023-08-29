@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3/pkg/headers"
-	"github.com/bluenviron/gortsplib/v3/pkg/url"
+	"github.com/bluenviron/gortsplib/v4/pkg/headers"
+	"github.com/bluenviron/gortsplib/v4/pkg/url"
 )
 
 var rePathName = regexp.MustCompile(`^[0-9a-zA-Z_\-/\.~]+$`)
@@ -50,6 +50,7 @@ type PathConf struct {
 	SourceOnDemand             bool           `json:"sourceOnDemand"`
 	SourceOnDemandStartTimeout StringDuration `json:"sourceOnDemandStartTimeout"`
 	SourceOnDemandCloseAfter   StringDuration `json:"sourceOnDemandCloseAfter"`
+	MaxReaders                 int            `json:"maxReaders"`
 
 	// authentication
 	PublishUser Credential `json:"publishUser"`
@@ -60,7 +61,8 @@ type PathConf struct {
 	ReadIPs     IPsOrCIDRs `json:"readIPs"`
 
 	// publisher
-	DisablePublisherOverride bool   `json:"disablePublisherOverride"`
+	OverridePublisher        bool   `json:"overridePublisher"`
+	DisablePublisherOverride bool   `json:"disablePublisherOverride"` // deprecated
 	Fallback                 string `json:"fallback"`
 
 	// rtsp
@@ -90,6 +92,7 @@ type PathConf struct {
 	RPICameraGain              float64 `json:"rpiCameraGain"`
 	RPICameraEV                float64 `json:"rpiCameraEV"`
 	RPICameraROI               string  `json:"rpiCameraROI"`
+	RPICameraHDR               bool    `json:"rpiCameraHDR"`
 	RPICameraTuningFile        string  `json:"rpiCameraTuningFile"`
 	RPICameraMode              string  `json:"rpiCameraMode"`
 	RPICameraFPS               float64 `json:"rpiCameraFPS"`
@@ -119,15 +122,17 @@ type PathConf struct {
 }
 
 func (pconf *PathConf) check(conf *Conf, name string) error {
-	// normal path
-	if name == "" || name[0] != '~' {
+	switch {
+	case name == "all":
+		pconf.Regexp = regexp.MustCompile("^.*$")
+
+	case name == "" || name[0] != '~': // normal path
 		err := IsValidPathName(name)
 		if err != nil {
 			return fmt.Errorf("invalid path name '%s': %s", name, err)
 		}
 
-		// regular expression path
-	} else {
+	default: // regular expression-based path
 		pathRegexp, err := regexp.Compile(name[1:])
 		if err != nil {
 			return fmt.Errorf("invalid regular expression: %s", name[1:])
@@ -146,7 +151,7 @@ func (pconf *PathConf) check(conf *Conf, name string) error {
 
 		_, err := url.Parse(pconf.Source)
 		if err != nil {
-			return fmt.Errorf("'%s' is not a valid RTSP URL", pconf.Source)
+			return fmt.Errorf("'%s' is not a valid URL", pconf.Source)
 		}
 
 	case strings.HasPrefix(pconf.Source, "rtmp://") ||
@@ -157,7 +162,7 @@ func (pconf *PathConf) check(conf *Conf, name string) error {
 
 		u, err := gourl.Parse(pconf.Source)
 		if err != nil {
-			return fmt.Errorf("'%s' is not a valid RTMP URL", pconf.Source)
+			return fmt.Errorf("'%s' is not a valid URL", pconf.Source)
 		}
 
 		if u.User != nil {
@@ -177,10 +182,10 @@ func (pconf *PathConf) check(conf *Conf, name string) error {
 
 		u, err := gourl.Parse(pconf.Source)
 		if err != nil {
-			return fmt.Errorf("'%s' is not a valid HLS URL", pconf.Source)
+			return fmt.Errorf("'%s' is not a valid URL", pconf.Source)
 		}
 		if u.Scheme != "http" && u.Scheme != "https" {
-			return fmt.Errorf("'%s' is not a valid HLS URL", pconf.Source)
+			return fmt.Errorf("'%s' is not a valid URL", pconf.Source)
 		}
 
 		if u.User != nil {
@@ -197,14 +202,31 @@ func (pconf *PathConf) check(conf *Conf, name string) error {
 			return fmt.Errorf("a path with a regular expression (or path 'all') cannot have a HLS source. use another path")
 		}
 
-		host, _, err := net.SplitHostPort(pconf.Source[len("udp://"):])
+		_, _, err := net.SplitHostPort(pconf.Source[len("udp://"):])
 		if err != nil {
 			return fmt.Errorf("'%s' is not a valid UDP URL", pconf.Source)
 		}
 
-		ip := net.ParseIP(host)
-		if ip == nil {
-			return fmt.Errorf("'%s' is not a valid IP", host)
+	case strings.HasPrefix(pconf.Source, "srt://"):
+		if pconf.Regexp != nil {
+			return fmt.Errorf("a path with a regular expression (or path 'all') cannot have a SRT source. use another path")
+		}
+
+		_, err := gourl.Parse(pconf.Source)
+		if err != nil {
+			return fmt.Errorf("'%s' is not a valid URL", pconf.Source)
+		}
+
+	case strings.HasPrefix(pconf.Source, "whep://") ||
+		strings.HasPrefix(pconf.Source, "wheps://"):
+		if pconf.Regexp != nil {
+			return fmt.Errorf("a path with a regular expression (or path 'all') " +
+				"cannot have a WebRTC/WHEP source. use another path")
+		}
+
+		_, err := gourl.Parse(pconf.Source)
+		if err != nil {
+			return fmt.Errorf("'%s' is not a valid URL", pconf.Source)
 		}
 
 	case pconf.Source == "redirect":
@@ -239,6 +261,10 @@ func (pconf *PathConf) check(conf *Conf, name string) error {
 		if pconf.Source == "publisher" {
 			return fmt.Errorf("'sourceOnDemand' is useless when source is 'publisher'")
 		}
+	}
+
+	if pconf.DisablePublisherOverride {
+		pconf.OverridePublisher = true
 	}
 
 	if pconf.Fallback != "" {
@@ -334,6 +360,9 @@ func (pconf PathConf) HasStaticSource() bool {
 		strings.HasPrefix(pconf.Source, "http://") ||
 		strings.HasPrefix(pconf.Source, "https://") ||
 		strings.HasPrefix(pconf.Source, "udp://") ||
+		strings.HasPrefix(pconf.Source, "srt://") ||
+		strings.HasPrefix(pconf.Source, "whep://") ||
+		strings.HasPrefix(pconf.Source, "wheps://") ||
 		pconf.Source == "rpiCamera"
 }
 
@@ -355,6 +384,9 @@ func (pconf *PathConf) UnmarshalJSON(b []byte) error {
 	// general
 	pconf.SourceOnDemandStartTimeout = 10 * StringDuration(time.Second)
 	pconf.SourceOnDemandCloseAfter = 10 * StringDuration(time.Second)
+
+	// publisher
+	pconf.OverridePublisher = true
 
 	// raspberry pi camera
 	pconf.RPICameraWidth = 1920

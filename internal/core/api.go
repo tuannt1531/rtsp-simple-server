@@ -7,11 +7,13 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/httpserv"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
@@ -139,6 +141,16 @@ func abortWithError(ctx *gin.Context, err error) {
 	}
 }
 
+func paramName(ctx *gin.Context) (string, bool) {
+	name := ctx.Param("name")
+
+	if len(name) < 2 || name[0] != '/' {
+		return "", false
+	}
+
+	return name[1:], true
+}
+
 type apiPathManager interface {
 	apiPathsList() (*apiPathsList, error)
 	apiPathsGet(string) (*apiPath, error)
@@ -169,6 +181,12 @@ type apiWebRTCManager interface {
 	apiSessionsKick(uuid.UUID) error
 }
 
+type apiSRTServer interface {
+	apiConnsList() (*apiSRTConnsList, error)
+	apiConnsGet(uuid.UUID) (*apiSRTConn, error)
+	apiConnsKick(uuid.UUID) error
+}
+
 type apiParent interface {
 	logger.Writer
 	apiConfigSet(conf *conf.Conf)
@@ -183,9 +201,10 @@ type api struct {
 	rtmpsServer   apiRTMPServer
 	hlsManager    apiHLSManager
 	webRTCManager apiWebRTCManager
+	srtServer     apiSRTServer
 	parent        apiParent
 
-	httpServer *httpServer
+	httpServer *httpserv.WrappedServer
 	mutex      sync.Mutex
 }
 
@@ -200,6 +219,7 @@ func newAPI(
 	rtmpsServer apiRTMPServer,
 	hlsManager apiHLSManager,
 	webRTCManager apiWebRTCManager,
+	srtServer apiSRTServer,
 	parent apiParent,
 ) (*api, error) {
 	a := &api{
@@ -211,15 +231,14 @@ func newAPI(
 		rtmpsServer:   rtmpsServer,
 		hlsManager:    hlsManager,
 		webRTCManager: webRTCManager,
+		srtServer:     srtServer,
 		parent:        parent,
 	}
 
 	router := gin.New()
-	router.SetTrustedProxies(nil)
+	router.SetTrustedProxies(nil) //nolint:errcheck
 
-	mwLog := httpLoggerMiddleware(a)
-	router.NoRoute(mwLog, httpServerHeaderMiddleware)
-	group := router.Group("/", mwLog, httpServerHeaderMiddleware)
+	group := router.Group("/")
 
 	group.GET("/v2/config/get", a.onConfigGet)
 	group.POST("/v2/config/set", a.onConfigSet)
@@ -229,11 +248,11 @@ func newAPI(
 
 	if !interfaceIsEmpty(a.hlsManager) {
 		group.GET("/v2/hlsmuxers/list", a.onHLSMuxersList)
-		group.GET("/v2/hlsmuxers/get/:name", a.onHLSMuxersGet)
+		group.GET("/v2/hlsmuxers/get/*name", a.onHLSMuxersGet)
 	}
 
 	group.GET("/v2/paths/list", a.onPathsList)
-	group.GET("/v2/paths/get/:name", a.onPathsGet)
+	group.GET("/v2/paths/get/*name", a.onPathsGet)
 
 	if !interfaceIsEmpty(a.rtspServer) {
 		group.GET("/v2/rtspconns/list", a.onRTSPConnsList)
@@ -269,13 +288,23 @@ func newAPI(
 		group.POST("/v2/webrtcsessions/kick/:id", a.onWebRTCSessionsKick)
 	}
 
+	if !interfaceIsEmpty(a.srtServer) {
+		group.GET("/v2/srtconns/list", a.onSRTConnsList)
+		group.GET("/v2/srtconns/get/:id", a.onSRTConnsGet)
+		group.POST("/v2/srtconns/kick/:id", a.onSRTConnsKick)
+	}
+
+	network, address := restrictNetwork("tcp", address)
+
 	var err error
-	a.httpServer, err = newHTTPServer(
+	a.httpServer, err = httpserv.NewWrappedServer(
+		network,
 		address,
-		readTimeout,
+		time.Duration(readTimeout),
 		"",
 		"",
 		router,
+		a,
 	)
 	if err != nil {
 		return nil, err
@@ -288,7 +317,7 @@ func newAPI(
 
 func (a *api) close() {
 	a.Log(logger.Info, "listener is closing")
-	a.httpServer.close()
+	a.httpServer.Close()
 }
 
 func (a *api) Log(level logger.Level, format string, args ...interface{}) {
@@ -333,12 +362,11 @@ func (a *api) onConfigSet(ctx *gin.Context) {
 }
 
 func (a *api) onConfigPathsAdd(ctx *gin.Context) {
-	name := ctx.Param("name")
-	if len(name) < 2 || name[0] != '/' {
+	name, ok := paramName(ctx)
+	if !ok {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
-	name = name[1:]
 
 	in, err := loadConfPathData(ctx)
 	if err != nil {
@@ -359,7 +387,7 @@ func (a *api) onConfigPathsAdd(ctx *gin.Context) {
 	newConfPath := &conf.PathConf{}
 
 	// load default values
-	newConfPath.UnmarshalJSON([]byte("{}"))
+	newConfPath.UnmarshalJSON([]byte("{}")) //nolint:errcheck
 
 	fillStruct(newConfPath, in)
 
@@ -381,12 +409,11 @@ func (a *api) onConfigPathsAdd(ctx *gin.Context) {
 }
 
 func (a *api) onConfigPathsEdit(ctx *gin.Context) {
-	name := ctx.Param("name")
-	if len(name) < 2 || name[0] != '/' {
+	name, ok := paramName(ctx)
+	if !ok {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
-	name = name[1:]
 
 	in, err := loadConfPathData(ctx)
 	if err != nil {
@@ -401,7 +428,7 @@ func (a *api) onConfigPathsEdit(ctx *gin.Context) {
 
 	newConfPath, ok := newConf.Paths[name]
 	if !ok {
-		ctx.AbortWithStatus(http.StatusBadRequest)
+		ctx.AbortWithStatus(http.StatusNotFound)
 		return
 	}
 
@@ -423,12 +450,11 @@ func (a *api) onConfigPathsEdit(ctx *gin.Context) {
 }
 
 func (a *api) onConfigPathsDelete(ctx *gin.Context) {
-	name := ctx.Param("name")
-	if len(name) < 2 || name[0] != '/' {
+	name, ok := paramName(ctx)
+	if !ok {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
-	name = name[1:]
 
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
@@ -475,7 +501,13 @@ func (a *api) onPathsList(ctx *gin.Context) {
 }
 
 func (a *api) onPathsGet(ctx *gin.Context) {
-	data, err := a.pathManager.apiPathsGet(ctx.Param("name"))
+	name, ok := paramName(ctx)
+	if !ok {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	data, err := a.pathManager.apiPathsGet(name)
 	if err != nil {
 		abortWithError(ctx, err)
 		return
@@ -771,7 +803,13 @@ func (a *api) onHLSMuxersList(ctx *gin.Context) {
 }
 
 func (a *api) onHLSMuxersGet(ctx *gin.Context) {
-	data, err := a.hlsManager.apiMuxersGet(ctx.Param("name"))
+	name, ok := paramName(ctx)
+	if !ok {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	data, err := a.hlsManager.apiMuxersGet(name)
 	if err != nil {
 		abortWithError(ctx, err)
 		return
@@ -822,6 +860,56 @@ func (a *api) onWebRTCSessionsKick(ctx *gin.Context) {
 	}
 
 	err = a.webRTCManager.apiSessionsKick(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.Status(http.StatusOK)
+}
+
+func (a *api) onSRTConnsList(ctx *gin.Context) {
+	data, err := a.srtServer.apiConnsList()
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	data.ItemCount = len(data.Items)
+	pageCount, err := paginate(&data.Items, ctx.Query("itemsPerPage"), ctx.Query("page"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	data.PageCount = pageCount
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onSRTConnsGet(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	data, err := a.srtServer.apiConnsGet(uuid)
+	if err != nil {
+		abortWithError(ctx, err)
+		return
+	}
+
+	ctx.JSON(http.StatusOK, data)
+}
+
+func (a *api) onSRTConnsKick(ctx *gin.Context) {
+	uuid, err := uuid.Parse(ctx.Param("id"))
+	if err != nil {
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	err = a.srtServer.apiConnsKick(uuid)
 	if err != nil {
 		abortWithError(ctx, err)
 		return

@@ -6,11 +6,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3"
-	"github.com/bluenviron/gortsplib/v3/pkg/auth"
-	"github.com/bluenviron/gortsplib/v3/pkg/base"
-	"github.com/bluenviron/gortsplib/v3/pkg/media"
-	"github.com/bluenviron/gortsplib/v3/pkg/url"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/auth"
+	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/url"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
@@ -41,9 +42,11 @@ func TestRTSPSource(t *testing.T) {
 		"tls",
 	} {
 		t.Run(source, func(t *testing.T) {
-			medi := testMediaH264
-			stream := gortsplib.NewServerStream(media.Medias{medi})
-			nonce := auth.GenerateNonce()
+			serverMedia := testMediaH264
+			var stream *gortsplib.ServerStream
+
+			nonce, err := auth.GenerateNonce()
+			require.NoError(t, err)
 
 			s := gortsplib.Server{
 				Handler: &testServer{
@@ -51,7 +54,7 @@ func TestRTSPSource(t *testing.T) {
 					) (*base.Response, *gortsplib.ServerStream, error) {
 						err := auth.Validate(ctx.Request, "testuser", "testpass", nil, nil, "IPCAM", nonce)
 						if err != nil {
-							return &base.Response{
+							return &base.Response{ //nolint:nilerr
 								StatusCode: base.StatusUnauthorized,
 								Header: base.Header{
 									"WWW-Authenticate": auth.GenerateWWWAuthenticate(nil, "IPCAM", nonce),
@@ -71,7 +74,7 @@ func TestRTSPSource(t *testing.T) {
 					onPlay: func(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
 						go func() {
 							time.Sleep(1 * time.Second)
-							stream.WritePacketRTP(medi, &rtp.Packet{
+							err := stream.WritePacketRTP(serverMedia, &rtp.Packet{
 								Header: rtp.Header{
 									Version:        0x02,
 									PayloadType:    96,
@@ -80,8 +83,9 @@ func TestRTSPSource(t *testing.T) {
 									SSRC:           978651231,
 									Marker:         true,
 								},
-								Payload: []byte{0x01, 0x02, 0x03, 0x04},
+								Payload: []byte{5, 1, 2, 3, 4},
 							})
+							require.NoError(t, err)
 						}()
 
 						return &base.Response{
@@ -112,10 +116,13 @@ func TestRTSPSource(t *testing.T) {
 				s.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
 			}
 
-			err := s.Start()
+			err = s.Start()
 			require.NoError(t, err)
-			defer s.Wait()
+			defer s.Wait() //nolint:errcheck
 			defer s.Close()
+
+			stream = gortsplib.NewServerStream(&s, &description.Session{Medias: []*description.Media{serverMedia}})
+			defer stream.Close()
 
 			if source == "udp" || source == "tcp" {
 				p, ok := newInstance("paths:\n" +
@@ -146,14 +153,17 @@ func TestRTSPSource(t *testing.T) {
 			require.NoError(t, err)
 			defer c.Close()
 
-			medias, baseURL, _, err := c.Describe(u)
+			desc, _, err := c.Describe(u)
 			require.NoError(t, err)
 
-			err = c.SetupAll(medias, baseURL)
+			var forma *format.H264
+			medi := desc.FindFormat(&forma)
+
+			_, err = c.Setup(desc.BaseURL, medi, 0, 0)
 			require.NoError(t, err)
 
-			c.OnPacketRTP(medias[0], medias[0].Formats[0], func(pkt *rtp.Packet) {
-				require.Equal(t, []byte{0x01, 0x02, 0x03, 0x04}, pkt.Payload)
+			c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+				require.Equal(t, []byte{5, 1, 2, 3, 4}, pkt.Payload)
 				close(received)
 			})
 
@@ -166,8 +176,11 @@ func TestRTSPSource(t *testing.T) {
 }
 
 func TestRTSPSourceNoPassword(t *testing.T) {
-	stream := gortsplib.NewServerStream(media.Medias{testMediaH264})
-	nonce := auth.GenerateNonce()
+	var stream *gortsplib.ServerStream
+
+	nonce, err := auth.GenerateNonce()
+	require.NoError(t, err)
+
 	done := make(chan struct{})
 
 	s := gortsplib.Server{
@@ -175,7 +188,7 @@ func TestRTSPSourceNoPassword(t *testing.T) {
 			onDescribe: func(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
 				err := auth.Validate(ctx.Request, "testuser", "", nil, nil, "IPCAM", nonce)
 				if err != nil {
-					return &base.Response{
+					return &base.Response{ //nolint:nilerr
 						StatusCode: base.StatusUnauthorized,
 						Header: base.Header{
 							"WWW-Authenticate": auth.GenerateWWWAuthenticate(nil, "IPCAM", nonce),
@@ -201,14 +214,18 @@ func TestRTSPSourceNoPassword(t *testing.T) {
 		},
 		RTSPAddress: "127.0.0.1:8555",
 	}
-	err := s.Start()
+
+	err = s.Start()
 	require.NoError(t, err)
-	defer s.Wait()
+	defer s.Wait() //nolint:errcheck
 	defer s.Close()
 
-	p, ok := newInstance("rtmpDisable: yes\n" +
-		"hlsDisable: yes\n" +
-		"webrtcDisable: yes\n" +
+	stream = gortsplib.NewServerStream(&s, &description.Session{Medias: []*description.Media{testMediaH264}})
+	defer stream.Close()
+
+	p, ok := newInstance("rtmp: no\n" +
+		"hls: no\n" +
+		"webrtc: no\n" +
 		"paths:\n" +
 		"  proxied:\n" +
 		"    source: rtsp://testuser:@127.0.0.1:8555/teststream\n" +
@@ -222,7 +239,7 @@ func TestRTSPSourceNoPassword(t *testing.T) {
 func TestRTSPSourceRange(t *testing.T) {
 	for _, ca := range []string{"clock", "npt", "smpte"} {
 		t.Run(ca, func(t *testing.T) {
-			stream := gortsplib.NewServerStream(media.Medias{testMediaH264})
+			var stream *gortsplib.ServerStream
 			done := make(chan struct{})
 
 			s := gortsplib.Server{
@@ -257,10 +274,14 @@ func TestRTSPSourceRange(t *testing.T) {
 				},
 				RTSPAddress: "127.0.0.1:8555",
 			}
+
 			err := s.Start()
 			require.NoError(t, err)
-			defer s.Wait()
+			defer s.Wait() //nolint:errcheck
 			defer s.Close()
+
+			stream = gortsplib.NewServerStream(&s, &description.Session{Medias: []*description.Media{testMediaH264}})
+			defer stream.Close()
 
 			var addConf string
 			switch ca {
@@ -276,9 +297,9 @@ func TestRTSPSourceRange(t *testing.T) {
 				addConf += "    rtspRangeType: smpte\n" +
 					"    rtspRangeStart: 130s\n"
 			}
-			p, ok := newInstance("rtmpDisable: yes\n" +
-				"hlsDisable: yes\n" +
-				"webrtcDisable: yes\n" +
+			p, ok := newInstance("rtmp: no\n" +
+				"hls: no\n" +
+				"webrtc: no\n" +
 				"paths:\n" +
 				"  proxied:\n" +
 				"    source: rtsp://testuser:@127.0.0.1:8555/teststream\n" + addConf)

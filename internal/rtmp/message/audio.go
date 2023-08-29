@@ -14,7 +14,7 @@ const (
 
 // supported audio codecs
 const (
-	CodecMPEG2Audio = 2
+	CodecMPEG1Audio = 2
 	CodecMPEG4Audio = 10
 )
 
@@ -52,7 +52,7 @@ func (m *Audio) Unmarshal(raw *rawmessage.Message) error {
 
 	m.Codec = raw.Body[0] >> 4
 	switch m.Codec {
-	case CodecMPEG2Audio, CodecMPEG4Audio:
+	case CodecMPEG1Audio, CodecMPEG4Audio:
 	default:
 		return fmt.Errorf("unsupported audio codec: %d", m.Codec)
 	}
@@ -61,7 +61,7 @@ func (m *Audio) Unmarshal(raw *rawmessage.Message) error {
 	m.Depth = (raw.Body[0] >> 1) & 0x01
 	m.Channels = raw.Body[0] & 0x01
 
-	if m.Codec == CodecMPEG2Audio {
+	if m.Codec == CodecMPEG1Audio {
 		m.Payload = raw.Body[1:]
 	} else {
 		m.AACType = AudioAACType(raw.Body[1])
@@ -77,19 +77,23 @@ func (m *Audio) Unmarshal(raw *rawmessage.Message) error {
 	return nil
 }
 
-// Marshal implements Message.
-func (m Audio) Marshal() (*rawmessage.Message, error) {
+func (m Audio) marshalBodySize() int {
 	var l int
-	if m.Codec == CodecMPEG2Audio {
+	if m.Codec == CodecMPEG1Audio {
 		l = 1 + len(m.Payload)
 	} else {
 		l = 2 + len(m.Payload)
 	}
-	body := make([]byte, l)
+	return l
+}
+
+// Marshal implements Message.
+func (m Audio) Marshal() (*rawmessage.Message, error) {
+	body := make([]byte, m.marshalBodySize())
 
 	body[0] = m.Codec<<4 | m.Rate<<2 | m.Depth<<1 | m.Channels
 
-	if m.Codec == CodecMPEG2Audio {
+	if m.Codec == CodecMPEG1Audio {
 		copy(body[1:], m.Payload)
 	} else {
 		body[1] = uint8(m.AACType)

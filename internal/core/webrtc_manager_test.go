@@ -2,119 +2,34 @@ package core
 
 import (
 	"bytes"
-	"io"
+	"context"
 	"net/http"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/media"
-	"github.com/bluenviron/gortsplib/v3/pkg/url"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/url"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
 	"github.com/stretchr/testify/require"
+
+	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/webrtcpc"
+	"github.com/bluenviron/mediamtx/internal/whip"
 )
 
-func whipGetICEServers(
-	t *testing.T,
-	hc *http.Client,
-	ur string,
-) []webrtc.ICEServer {
-	req, err := http.NewRequest("OPTIONS", ur, nil)
-	require.NoError(t, err)
+type nilLogger struct{}
 
-	res, err := hc.Do(req)
-	require.NoError(t, err)
-	defer res.Body.Close()
-
-	require.Equal(t, http.StatusOK, res.StatusCode)
-
-	link, ok := res.Header["Link"]
-	require.Equal(t, true, ok)
-	servers := linkHeaderToIceServers(link)
-	require.NotEqual(t, 0, len(servers))
-
-	return servers
-}
-
-func whipPostOffer(
-	t *testing.T,
-	hc *http.Client,
-	ur string,
-	offer *webrtc.SessionDescription,
-) (*webrtc.SessionDescription, string) {
-	req, err := http.NewRequest("POST", ur, bytes.NewReader([]byte(offer.SDP)))
-	require.NoError(t, err)
-
-	req.Header.Set("Content-Type", "application/sdp")
-
-	res, err := hc.Do(req)
-	require.NoError(t, err)
-	defer res.Body.Close()
-
-	require.Equal(t, http.StatusCreated, res.StatusCode)
-	require.Equal(t, "application/sdp", res.Header.Get("Content-Type"))
-	require.Equal(t, "application/trickle-ice-sdpfrag", res.Header.Get("Accept-Patch"))
-	loc := req.URL.Path
-	if req.URL.RawQuery != "" {
-		loc += "?" + req.URL.RawQuery
-	}
-	require.Equal(t, loc, res.Header.Get("Location"))
-
-	link, ok := res.Header["Link"]
-	require.Equal(t, true, ok)
-	servers := linkHeaderToIceServers(link)
-	require.NotEqual(t, 0, len(servers))
-
-	etag := res.Header.Get("E-Tag")
-	require.NotEqual(t, "", etag)
-
-	require.NotEqual(t, "", res.Header.Get("ID"))
-
-	sdp, err := io.ReadAll(res.Body)
-	require.NoError(t, err)
-
-	answer := &webrtc.SessionDescription{
-		Type: webrtc.SDPTypeAnswer,
-		SDP:  string(sdp),
-	}
-
-	return answer, etag
-}
-
-func whipPostCandidate(
-	t *testing.T,
-	ur string,
-	offer *webrtc.SessionDescription,
-	etag string,
-	candidate *webrtc.ICECandidateInit,
-) {
-	frag, err := marshalICEFragment(offer, []*webrtc.ICECandidateInit{candidate})
-	require.NoError(t, err)
-
-	req, err := http.NewRequest("PATCH", ur, bytes.NewReader(frag))
-	require.NoError(t, err)
-
-	req.Header.Set("Content-Type", "application/trickle-ice-sdpfrag")
-	req.Header.Set("If-Match", etag)
-
-	hc := &http.Client{Transport: &http.Transport{}}
-
-	res, err := hc.Do(req)
-	require.NoError(t, err)
-	defer res.Body.Close()
-
-	require.Equal(t, http.StatusNoContent, res.StatusCode)
+func (nilLogger) Log(_ logger.Level, _ string, _ ...interface{}) {
 }
 
 type webRTCTestClient struct {
-	pc             *webrtc.PeerConnection
+	pc             *webrtcpc.PeerConnection
 	outgoingTrack1 *webrtc.TrackLocalStaticRTP
 	outgoingTrack2 *webrtc.TrackLocalStaticRTP
 	incomingTrack  chan *webrtc.TrackRemote
-	closed         chan struct{}
 }
 
 func newWebRTCTestClient(
@@ -123,35 +38,16 @@ func newWebRTCTestClient(
 	ur string,
 	publish bool,
 ) *webRTCTestClient {
-	iceServers := whipGetICEServers(t, hc, ur)
-
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: iceServers,
-	})
+	iceServers, err := whip.GetICEServers(context.Background(), hc, ur)
 	require.NoError(t, err)
 
-	connected := make(chan struct{})
-	closed := make(chan struct{})
-	var stateChangeMutex sync.Mutex
+	c := &webRTCTestClient{}
 
-	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		stateChangeMutex.Lock()
-		defer stateChangeMutex.Unlock()
+	api, err := webrtcNewAPI(nil, nil, nil)
+	require.NoError(t, err)
 
-		select {
-		case <-closed:
-			return
-		default:
-		}
-
-		switch state {
-		case webrtc.PeerConnectionStateConnected:
-			close(connected)
-
-		case webrtc.PeerConnectionStateClosed:
-			close(closed)
-		}
-	})
+	pc, err := webrtcpc.New(iceServers, api, nilLogger{})
+	require.NoError(t, err)
 
 	var outgoingTrack1 *webrtc.TrackLocalStaticRTP
 	var outgoingTrack2 *webrtc.TrackLocalStaticRTP
@@ -198,31 +94,30 @@ func newWebRTCTestClient(
 	offer, err := pc.CreateOffer(nil)
 	require.NoError(t, err)
 
-	answer, etag := whipPostOffer(t, hc, ur, &offer)
-
-	// test adding additional candidates, even if it is not mandatory here
-	gatheringDone := make(chan struct{})
-	pc.OnICECandidate(func(i *webrtc.ICECandidate) {
-		if i != nil {
-			c := i.ToJSON()
-			whipPostCandidate(t, ur, &offer, etag, &c)
-		} else {
-			close(gatheringDone)
-		}
-	})
+	res, err := whip.PostOffer(context.Background(), hc, ur, &offer)
+	require.NoError(t, err)
 
 	err = pc.SetLocalDescription(offer)
 	require.NoError(t, err)
 
-	err = pc.SetRemoteDescription(*answer)
+	// test adding additional candidates, even if it is not mandatory here
+outer:
+	for {
+		select {
+		case c := <-pc.NewLocalCandidate():
+			err := whip.PostCandidate(context.Background(), hc, ur, &offer, res.ETag, c)
+			require.NoError(t, err)
+		case <-pc.GatheringDone():
+			break outer
+		}
+	}
+
+	err = pc.SetRemoteDescription(*res.Answer)
 	require.NoError(t, err)
 
-	<-gatheringDone
-	<-connected
+	<-pc.Connected()
 
 	if publish {
-		time.Sleep(200 * time.Millisecond)
-
 		err := outgoingTrack1.WriteRTP(&rtp.Packet{
 			Header: rtp.Header{
 				Version:        2,
@@ -232,7 +127,7 @@ func newWebRTCTestClient(
 				Timestamp:      45343,
 				SSRC:           563423,
 			},
-			Payload: []byte{0x01, 0x02, 0x03, 0x04},
+			Payload: []byte{1},
 		})
 		require.NoError(t, err)
 
@@ -245,25 +140,22 @@ func newWebRTCTestClient(
 				Timestamp:      45343,
 				SSRC:           563423,
 			},
-			Payload: []byte{0x01, 0x02, 0x03, 0x04},
+			Payload: []byte{2},
 		})
 		require.NoError(t, err)
 
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	return &webRTCTestClient{
-		pc:             pc,
-		outgoingTrack1: outgoingTrack1,
-		outgoingTrack2: outgoingTrack2,
-		incomingTrack:  incomingTrack,
-		closed:         closed,
-	}
+	c.pc = pc
+	c.outgoingTrack1 = outgoingTrack1
+	c.outgoingTrack2 = outgoingTrack2
+	c.incomingTrack = incomingTrack
+	return c
 }
 
 func (c *webRTCTestClient) close() {
 	c.pc.Close()
-	<-c.closed
 }
 
 func TestWebRTCRead(t *testing.T) {
@@ -301,9 +193,9 @@ func TestWebRTCRead(t *testing.T) {
 				a = newTestHTTPAuthenticator(t, "rtsp", "publish")
 			}
 
-			medi := &media.Media{
-				Type: media.TypeVideo,
-				Formats: []formats.Format{&formats.H264{
+			medi := &description.Media{
+				Type: description.MediaTypeVideo,
+				Formats: []format.Format{&format.H264{
 					PayloadTyp:        96,
 					PacketizationMode: 1,
 				}},
@@ -314,7 +206,8 @@ func TestWebRTCRead(t *testing.T) {
 				Transport: &v,
 			}
 			err := source.StartRecording(
-				"rtsp://testpublisher:testpass@localhost:8554/teststream?param=value", media.Medias{medi})
+				"rtsp://testpublisher:testpass@localhost:8554/teststream?param=value",
+				&description.Session{Medias: []*description.Media{medi}})
 			require.NoError(t, err)
 			defer source.Close()
 
@@ -350,7 +243,7 @@ func TestWebRTCRead(t *testing.T) {
 
 			time.Sleep(500 * time.Millisecond)
 
-			source.WritePacketRTP(medi, &rtp.Packet{
+			err = source.WritePacketRTP(medi, &rtp.Packet{
 				Header: rtp.Header{
 					Version:        2,
 					Marker:         true,
@@ -359,8 +252,9 @@ func TestWebRTCRead(t *testing.T) {
 					Timestamp:      45343,
 					SSRC:           563423,
 				},
-				Payload: []byte{0x01, 0x02, 0x03, 0x04},
+				Payload: []byte{5, 3},
 			})
+			require.NoError(t, err)
 
 			trak := <-c.incomingTrack
 
@@ -370,13 +264,13 @@ func TestWebRTCRead(t *testing.T) {
 				Header: rtp.Header{
 					Version:        2,
 					Marker:         true,
-					PayloadType:    102,
+					PayloadType:    100,
 					SequenceNumber: pkt.SequenceNumber,
 					Timestamp:      pkt.Timestamp,
 					SSRC:           pkt.SSRC,
 					CSRC:           []uint32{},
 				},
-				Payload: []byte{0x01, 0x02, 0x03, 0x04},
+				Payload: []byte{5, 3},
 			}, pkt)
 		})
 	}
@@ -390,13 +284,14 @@ func TestWebRTCReadNotFound(t *testing.T) {
 
 	hc := &http.Client{Transport: &http.Transport{}}
 
-	iceServers := whipGetICEServers(t, hc, "http://localhost:8889/stream/whep")
+	iceServers, err := whip.GetICEServers(context.Background(), hc, "http://localhost:8889/stream/whep")
+	require.NoError(t, err)
 
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
 		ICEServers: iceServers,
 	})
 	require.NoError(t, err)
-	defer pc.Close()
+	defer pc.Close() //nolint:errcheck
 
 	_, err = pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo)
 	require.NoError(t, err)
@@ -464,7 +359,7 @@ func TestWebRTCPublish(t *testing.T) {
 				require.NoError(t, err)
 				defer res.Body.Close()
 
-				require.Equal(t, http.StatusOK, res.StatusCode)
+				require.Equal(t, http.StatusNoContent, res.StatusCode)
 
 				if auth != "none" {
 					_, ok := res.Header["Link"]
@@ -513,19 +408,19 @@ func TestWebRTCPublish(t *testing.T) {
 			require.NoError(t, err)
 			defer c.Close()
 
-			medias, baseURL, _, err := c.Describe(u)
+			desc, _, err := c.Describe(u)
 			require.NoError(t, err)
 
-			var forma *formats.VP8
-			medi := medias.FindFormat(&forma)
+			var forma *format.VP8
+			medi := desc.FindFormat(&forma)
 
-			_, err = c.Setup(medi, baseURL, 0, 0)
+			_, err = c.Setup(desc.BaseURL, medi, 0, 0)
 			require.NoError(t, err)
 
 			received := make(chan struct{})
 
 			c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
-				require.Equal(t, []byte{0x05, 0x06, 0x07, 0x08}, pkt.Payload)
+				require.Equal(t, []byte{3}, pkt.Payload)
 				close(received)
 			})
 
@@ -541,7 +436,7 @@ func TestWebRTCPublish(t *testing.T) {
 					Timestamp:      45343,
 					SSRC:           563423,
 				},
-				Payload: []byte{0x05, 0x06, 0x07, 0x08},
+				Payload: []byte{3},
 			})
 			require.NoError(t, err)
 

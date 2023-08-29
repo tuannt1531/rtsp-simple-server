@@ -15,29 +15,29 @@ func TestServerConn(t *testing.T) {
 	pingReceived := make(chan struct{})
 	pingInterval = 100 * time.Millisecond
 
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		c, err := NewServerConn(w, r)
-		require.NoError(t, err)
-		defer c.Close()
+	s := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := NewServerConn(w, r)
+			require.NoError(t, err)
+			defer c.Close()
 
-		err = c.WriteJSON("testing")
-		require.NoError(t, err)
+			err = c.WriteJSON("testing")
+			require.NoError(t, err)
 
-		<-pingReceived
+			<-pingReceived
+		}),
 	}
 
 	ln, err := net.Listen("tcp", "localhost:6344")
 	require.NoError(t, err)
-	defer ln.Close()
 
-	s := &http.Server{Handler: http.HandlerFunc(handler)}
 	go s.Serve(ln)
 	defer s.Shutdown(context.Background())
 
 	c, res, err := websocket.DefaultDialer.Dial("ws://localhost:6344/", nil)
 	require.NoError(t, err)
 	defer res.Body.Close()
-	defer c.Close()
+	defer c.Close() //nolint:errcheck
 
 	c.SetPingHandler(func(msg string) error {
 		close(pingReceived)
@@ -49,7 +49,8 @@ func TestServerConn(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "testing", msg)
 
-	c.ReadMessage()
+	_, _, err = c.ReadMessage()
+	require.Error(t, err)
 
 	<-pingReceived
 }

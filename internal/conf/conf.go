@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/bluenviron/gohlslib"
-	"github.com/bluenviron/gortsplib/v3"
-	"github.com/bluenviron/gortsplib/v3/pkg/headers"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/headers"
 
 	"github.com/bluenviron/mediamtx/internal/conf/decrypt"
 	"github.com/bluenviron/mediamtx/internal/conf/env"
@@ -45,7 +45,8 @@ func loadFromFile(fpath string, conf *Conf) (bool, error) {
 	// other configuration files are not
 	if fpath == "mediamtx.yml" || fpath == "rtsp-simple-server.yml" {
 		if _, err := os.Stat(fpath); errors.Is(err, os.ErrNotExist) {
-			conf.UnmarshalJSON(nil) // load defaults
+			// load defaults
+			conf.UnmarshalJSON(nil) //nolint:errcheck
 			return false, nil
 		}
 	}
@@ -77,6 +78,15 @@ func loadFromFile(fpath string, conf *Conf) (bool, error) {
 	return true, nil
 }
 
+func contains(list []headers.AuthMethod, item headers.AuthMethod) bool {
+	for _, i := range list {
+		if i == item {
+			return true
+		}
+	}
+	return false
+}
+
 // Conf is a configuration.
 type Conf struct {
 	// general
@@ -85,7 +95,8 @@ type Conf struct {
 	LogFile                   string          `json:"logFile"`
 	ReadTimeout               StringDuration  `json:"readTimeout"`
 	WriteTimeout              StringDuration  `json:"writeTimeout"`
-	ReadBufferCount           int             `json:"readBufferCount"`
+	ReadBufferCount           int             `json:"readBufferCount"` // deprecated
+	WriteQueueSize            int             `json:"writeQueueSize"`
 	UDPMaxPayloadSize         int             `json:"udpMaxPayloadSize"`
 	ExternalAuthenticationURL string          `json:"externalAuthenticationURL"`
 	API                       bool            `json:"api"`
@@ -98,7 +109,8 @@ type Conf struct {
 	RunOnConnectRestart       bool            `json:"runOnConnectRestart"`
 
 	// RTSP
-	RTSPDisable       bool        `json:"rtspDisable"`
+	RTSP              bool        `json:"rtsp"`
+	RTSPDisable       bool        `json:"rtspDisable"` // deprecated
 	Protocols         Protocols   `json:"protocols"`
 	Encryption        Encryption  `json:"encryption"`
 	RTSPAddress       string      `json:"rtspAddress"`
@@ -113,7 +125,8 @@ type Conf struct {
 	AuthMethods       AuthMethods `json:"authMethods"`
 
 	// RTMP
-	RTMPDisable    bool       `json:"rtmpDisable"`
+	RTMP           bool       `json:"rtmp"`
+	RTMPDisable    bool       `json:"rtmpDisable"` // deprecated
 	RTMPAddress    string     `json:"rtmpAddress"`
 	RTMPEncryption Encryption `json:"rtmpEncryption"`
 	RTMPSAddress   string     `json:"rtmpsAddress"`
@@ -121,7 +134,8 @@ type Conf struct {
 	RTMPServerCert string     `json:"rtmpServerCert"`
 
 	// HLS
-	HLSDisable         bool           `json:"hlsDisable"`
+	HLS                bool           `json:"hls"`
+	HLSDisable         bool           `json:"hlsDisable"` // depreacted
 	HLSAddress         string         `json:"hlsAddress"`
 	HLSEncryption      bool           `json:"hlsEncryption"`
 	HLSServerKey       string         `json:"hlsServerKey"`
@@ -137,7 +151,8 @@ type Conf struct {
 	HLSDirectory       string         `json:"hlsDirectory"`
 
 	// WebRTC
-	WebRTCDisable           bool              `json:"webrtcDisable"`
+	WebRTC                  bool              `json:"webrtc"`
+	WebRTCDisable           bool              `json:"webrtcDisable"` // deprecated
 	WebRTCAddress           string            `json:"webrtcAddress"`
 	WebRTCEncryption        bool              `json:"webrtcEncryption"`
 	WebRTCServerKey         string            `json:"webrtcServerKey"`
@@ -149,6 +164,10 @@ type Conf struct {
 	WebRTCICEHostNAT1To1IPs []string          `json:"webrtcICEHostNAT1To1IPs"`
 	WebRTCICEUDPMuxAddress  string            `json:"webrtcICEUDPMuxAddress"`
 	WebRTCICETCPMuxAddress  string            `json:"webrtcICETCPMuxAddress"`
+
+	// SRT
+	SRT        bool   `json:"srt"`
+	SRTAddress string `json:"srtAddress"`
 
 	// paths
 	Paths map[string]*PathConf `json:"paths"`
@@ -197,20 +216,14 @@ func (conf Conf) Clone() *Conf {
 	return &dest
 }
 
-func contains(list []headers.AuthMethod, item headers.AuthMethod) bool {
-	for _, i := range list {
-		if i == item {
-			return true
-		}
-	}
-	return false
-}
-
 // Check checks the configuration for errors.
 func (conf *Conf) Check() error {
 	// general
-	if (conf.ReadBufferCount & (conf.ReadBufferCount - 1)) != 0 {
-		return fmt.Errorf("'readBufferCount' must be a power of two")
+	if conf.ReadBufferCount != 0 {
+		conf.WriteQueueSize = conf.ReadBufferCount
+	}
+	if (conf.WriteQueueSize & (conf.WriteQueueSize - 1)) != 0 {
+		return fmt.Errorf("'writeQueueSize' must be a power of two")
 	}
 	if conf.UDPMaxPayloadSize > 1472 {
 		return fmt.Errorf("'udpMaxPayloadSize' must be less than 1472")
@@ -227,6 +240,9 @@ func (conf *Conf) Check() error {
 	}
 
 	// RTSP
+	if conf.RTSPDisable {
+		conf.RTSP = false
+	}
 	if conf.Encryption == EncryptionStrict {
 		if _, ok := conf.Protocols[Protocol(gortsplib.TransportUDP)]; ok {
 			return fmt.Errorf("strict encryption can't be used with the UDP transport protocol")
@@ -236,7 +252,20 @@ func (conf *Conf) Check() error {
 		}
 	}
 
+	// RTMP
+	if conf.RTMPDisable {
+		conf.RTMP = false
+	}
+
+	// HLS
+	if conf.HLSDisable {
+		conf.HLS = false
+	}
+
 	// WebRTC
+	if conf.WebRTCDisable {
+		conf.WebRTC = false
+	}
 	for _, server := range conf.WebRTCICEServers {
 		parts := strings.Split(server, ":")
 		if len(parts) == 5 {
@@ -266,17 +295,12 @@ func (conf *Conf) Check() error {
 		conf.Paths = make(map[string]*PathConf)
 	}
 
-	// "all" is an alias for "~^.*$"
-	if _, ok := conf.Paths["all"]; ok {
-		conf.Paths["~^.*$"] = conf.Paths["all"]
-		delete(conf.Paths, "all")
-	}
-
 	for _, name := range getSortedKeys(conf.Paths) {
 		pconf := conf.Paths[name]
 		if pconf == nil {
 			pconf = &PathConf{}
-			pconf.UnmarshalJSON(nil) // fill defaults
+			// load defaults
+			pconf.UnmarshalJSON(nil) //nolint:errcheck
 			conf.Paths[name] = pconf
 		}
 
@@ -297,13 +321,14 @@ func (conf *Conf) UnmarshalJSON(b []byte) error {
 	conf.LogFile = "mediamtx.log"
 	conf.ReadTimeout = 10 * StringDuration(time.Second)
 	conf.WriteTimeout = 10 * StringDuration(time.Second)
-	conf.ReadBufferCount = 512
+	conf.WriteQueueSize = 512
 	conf.UDPMaxPayloadSize = 1472
 	conf.APIAddress = "127.0.0.1:9997"
 	conf.MetricsAddress = "127.0.0.1:9998"
 	conf.PPROFAddress = "127.0.0.1:9999"
 
 	// RTSP
+	conf.RTSP = true
 	conf.Protocols = Protocols{
 		Protocol(gortsplib.TransportUDP):          {},
 		Protocol(gortsplib.TransportUDPMulticast): {},
@@ -321,10 +346,12 @@ func (conf *Conf) UnmarshalJSON(b []byte) error {
 	conf.AuthMethods = AuthMethods{headers.AuthBasic}
 
 	// RTMP
+	conf.RTMP = true
 	conf.RTMPAddress = ":1935"
 	conf.RTMPSAddress = ":1936"
 
 	// HLS
+	conf.HLS = true
 	conf.HLSAddress = ":8888"
 	conf.HLSServerKey = "server.key"
 	conf.HLSServerCert = "server.crt"
@@ -336,11 +363,16 @@ func (conf *Conf) UnmarshalJSON(b []byte) error {
 	conf.HLSAllowOrigin = "*"
 
 	// WebRTC
+	conf.WebRTC = true
 	conf.WebRTCAddress = ":8889"
 	conf.WebRTCServerKey = "server.key"
 	conf.WebRTCServerCert = "server.crt"
 	conf.WebRTCAllowOrigin = "*"
 	conf.WebRTCICEServers2 = []WebRTCICEServer{{URL: "stun:stun.l.google.com:19302"}}
+
+	// SRT
+	conf.SRT = true
+	conf.SRTAddress = ":8890"
 
 	type alias Conf
 	d := json.NewDecoder(bytes.NewReader(b))

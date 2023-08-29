@@ -42,7 +42,7 @@ type hlsManager struct {
 	partDuration              conf.StringDuration
 	segmentMaxSize            conf.StringSize
 	directory                 string
-	readBufferCount           int
+	writeQueueSize            int
 	pathManager               *pathManager
 	metrics                   *metrics
 	parent                    hlsManagerParent
@@ -54,16 +54,15 @@ type hlsManager struct {
 	muxers     map[string]*hlsMuxer
 
 	// in
-	chPathSourceReady    chan *path
-	chPathSourceNotReady chan *path
-	chHandleRequest      chan hlsMuxerHandleRequestReq
-	chMuxerClose         chan *hlsMuxer
-	chAPIMuxerList       chan hlsManagerAPIMuxersListReq
-	chAPIMuxerGet        chan hlsManagerAPIMuxersGetReq
+	chPathReady     chan *path
+	chPathNotReady  chan *path
+	chHandleRequest chan hlsMuxerHandleRequestReq
+	chCloseMuxer    chan *hlsMuxer
+	chAPIMuxerList  chan hlsManagerAPIMuxersListReq
+	chAPIMuxerGet   chan hlsManagerAPIMuxersGetReq
 }
 
 func newHLSManager(
-	parentCtx context.Context,
 	address string,
 	encryption bool,
 	serverKey string,
@@ -79,12 +78,12 @@ func newHLSManager(
 	trustedProxies conf.IPsOrCIDRs,
 	directory string,
 	readTimeout conf.StringDuration,
-	readBufferCount int,
+	writeQueueSize int,
 	pathManager *pathManager,
 	metrics *metrics,
 	parent hlsManagerParent,
 ) (*hlsManager, error) {
-	ctx, ctxCancel := context.WithCancel(parentCtx)
+	ctx, ctxCancel := context.WithCancel(context.Background())
 
 	m := &hlsManager{
 		externalAuthenticationURL: externalAuthenticationURL,
@@ -95,17 +94,17 @@ func newHLSManager(
 		partDuration:              partDuration,
 		segmentMaxSize:            segmentMaxSize,
 		directory:                 directory,
-		readBufferCount:           readBufferCount,
+		writeQueueSize:            writeQueueSize,
 		pathManager:               pathManager,
 		parent:                    parent,
 		metrics:                   metrics,
 		ctx:                       ctx,
 		ctxCancel:                 ctxCancel,
 		muxers:                    make(map[string]*hlsMuxer),
-		chPathSourceReady:         make(chan *path),
-		chPathSourceNotReady:      make(chan *path),
+		chPathReady:               make(chan *path),
+		chPathNotReady:            make(chan *path),
 		chHandleRequest:           make(chan hlsMuxerHandleRequestReq),
-		chMuxerClose:              make(chan *hlsMuxer),
+		chCloseMuxer:              make(chan *hlsMuxer),
 		chAPIMuxerList:            make(chan hlsManagerAPIMuxersListReq),
 		chAPIMuxerGet:             make(chan hlsManagerAPIMuxersGetReq),
 	}
@@ -129,10 +128,10 @@ func newHLSManager(
 
 	m.Log(logger.Info, "listener opened on "+address)
 
-	m.pathManager.hlsManagerSet(m)
+	m.pathManager.setHLSManager(m)
 
 	if m.metrics != nil {
-		m.metrics.hlsManagerSet(m)
+		m.metrics.setHLSManager(m)
 	}
 
 	m.wg.Add(1)
@@ -158,14 +157,14 @@ func (m *hlsManager) run() {
 outer:
 	for {
 		select {
-		case pa := <-m.chPathSourceReady:
+		case pa := <-m.chPathReady:
 			if m.alwaysRemux && !pa.conf.SourceOnDemand {
 				if _, ok := m.muxers[pa.name]; !ok {
 					m.createMuxer(pa.name, "")
 				}
 			}
 
-		case pa := <-m.chPathSourceNotReady:
+		case pa := <-m.chPathNotReady:
 			c, ok := m.muxers[pa.name]
 			if ok && c.remoteAddr == "" { // created with "always remux"
 				c.close()
@@ -183,7 +182,7 @@ outer:
 				r.processRequest(&req)
 			}
 
-		case c := <-m.chMuxerClose:
+		case c := <-m.chCloseMuxer:
 			if c2, ok := m.muxers[c.PathName()]; !ok || c2 != c {
 				continue
 			}
@@ -224,10 +223,10 @@ outer:
 
 	m.httpServer.close()
 
-	m.pathManager.hlsManagerSet(nil)
+	m.pathManager.setHLSManager(nil)
 
 	if m.metrics != nil {
-		m.metrics.hlsManagerSet(nil)
+		m.metrics.setHLSManager(nil)
 	}
 }
 
@@ -242,7 +241,7 @@ func (m *hlsManager) createMuxer(pathName string, remoteAddr string) *hlsMuxer {
 		m.partDuration,
 		m.segmentMaxSize,
 		m.directory,
-		m.readBufferCount,
+		m.writeQueueSize,
 		&m.wg,
 		pathName,
 		m.pathManager,
@@ -251,26 +250,26 @@ func (m *hlsManager) createMuxer(pathName string, remoteAddr string) *hlsMuxer {
 	return r
 }
 
-// muxerClose is called by hlsMuxer.
-func (m *hlsManager) muxerClose(c *hlsMuxer) {
+// closeMuxer is called by hlsMuxer.
+func (m *hlsManager) closeMuxer(c *hlsMuxer) {
 	select {
-	case m.chMuxerClose <- c:
+	case m.chCloseMuxer <- c:
 	case <-m.ctx.Done():
 	}
 }
 
-// pathSourceReady is called by pathManager.
-func (m *hlsManager) pathSourceReady(pa *path) {
+// pathReady is called by pathManager.
+func (m *hlsManager) pathReady(pa *path) {
 	select {
-	case m.chPathSourceReady <- pa:
+	case m.chPathReady <- pa:
 	case <-m.ctx.Done():
 	}
 }
 
-// pathSourceNotReady is called by pathManager.
-func (m *hlsManager) pathSourceNotReady(pa *path) {
+// pathNotReady is called by pathManager.
+func (m *hlsManager) pathNotReady(pa *path) {
 	select {
-	case m.chPathSourceNotReady <- pa:
+	case m.chPathNotReady <- pa:
 	case <-m.ctx.Done():
 	}
 }

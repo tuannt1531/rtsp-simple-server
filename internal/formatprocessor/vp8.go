@@ -4,43 +4,24 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats/rtpvp8"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtpvp8"
 	"github.com/pion/rtp"
 
-	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
-
-// UnitVP8 is a VP8 data unit.
-type UnitVP8 struct {
-	RTPPackets []*rtp.Packet
-	NTP        time.Time
-	PTS        time.Duration
-	Frame      []byte
-}
-
-// GetRTPPackets implements Unit.
-func (d *UnitVP8) GetRTPPackets() []*rtp.Packet {
-	return d.RTPPackets
-}
-
-// GetNTP implements Unit.
-func (d *UnitVP8) GetNTP() time.Time {
-	return d.NTP
-}
 
 type formatProcessorVP8 struct {
 	udpMaxPayloadSize int
-	format            *formats.VP8
+	format            *format.VP8
 	encoder           *rtpvp8.Encoder
 	decoder           *rtpvp8.Decoder
 }
 
 func newVP8(
 	udpMaxPayloadSize int,
-	forma *formats.VP8,
+	forma *format.VP8,
 	generateRTPPackets bool,
-	_ logger.Writer,
 ) (*formatProcessorVP8, error) {
 	t := &formatProcessorVP8{
 		udpMaxPayloadSize: udpMaxPayloadSize,
@@ -65,8 +46,8 @@ func (t *formatProcessorVP8) createEncoder() error {
 	return t.encoder.Init()
 }
 
-func (t *formatProcessorVP8) Process(unit Unit, hasNonRTSPReaders bool) error { //nolint:dupl
-	tunit := unit.(*UnitVP8)
+func (t *formatProcessorVP8) Process(y unit.Unit, hasNonRTSPReaders bool) error { //nolint:dupl
+	tunit := y.(*unit.VP8)
 
 	if tunit.RTPPackets != nil {
 		pkt := tunit.RTPPackets[0]
@@ -84,22 +65,21 @@ func (t *formatProcessorVP8) Process(unit Unit, hasNonRTSPReaders bool) error { 
 		if hasNonRTSPReaders || t.decoder != nil {
 			if t.decoder == nil {
 				var err error
-				t.decoder, err = t.format.CreateDecoder2()
+				t.decoder, err = t.format.CreateDecoder()
 				if err != nil {
 					return err
 				}
 			}
 
-			frame, pts, err := t.decoder.Decode(pkt)
+			frame, err := t.decoder.Decode(pkt)
 			if err != nil {
-				if err == rtpvp8.ErrMorePacketsNeeded {
+				if err == rtpvp8.ErrNonStartingPacketAndNoPrevious || err == rtpvp8.ErrMorePacketsNeeded {
 					return nil
 				}
 				return err
 			}
 
 			tunit.Frame = frame
-			tunit.PTS = pts
 		}
 
 		// route packet as is
@@ -107,18 +87,22 @@ func (t *formatProcessorVP8) Process(unit Unit, hasNonRTSPReaders bool) error { 
 	}
 
 	// encode into RTP
-	pkts, err := t.encoder.Encode(tunit.Frame, tunit.PTS)
+	pkts, err := t.encoder.Encode(tunit.Frame)
 	if err != nil {
 		return err
 	}
+	setTimestamp(pkts, tunit.RTPPackets, t.format.ClockRate(), tunit.PTS)
 	tunit.RTPPackets = pkts
 
 	return nil
 }
 
-func (t *formatProcessorVP8) UnitForRTPPacket(pkt *rtp.Packet, ntp time.Time) Unit {
-	return &UnitVP8{
-		RTPPackets: []*rtp.Packet{pkt},
-		NTP:        ntp,
+func (t *formatProcessorVP8) UnitForRTPPacket(pkt *rtp.Packet, ntp time.Time, pts time.Duration) Unit {
+	return &unit.VP8{
+		Base: unit.Base{
+			RTPPackets: []*rtp.Packet{pkt},
+			NTP:        ntp,
+			PTS:        pts,
+		},
 	}
 }

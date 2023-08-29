@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3"
-	"github.com/bluenviron/gortsplib/v3/pkg/base"
-	"github.com/bluenviron/gortsplib/v3/pkg/headers"
-	"github.com/bluenviron/gortsplib/v3/pkg/liberrors"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/headers"
+	"github.com/bluenviron/gortsplib/v4/pkg/liberrors"
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
@@ -63,12 +63,11 @@ type rtspServer struct {
 }
 
 func newRTSPServer(
-	parentCtx context.Context,
 	address string,
 	authMethods []headers.AuthMethod,
 	readTimeout conf.StringDuration,
 	writeTimeout conf.StringDuration,
-	readBufferCount int,
+	writeQueueSize int,
 	useUDP bool,
 	useMulticast bool,
 	rtpAddress string,
@@ -88,7 +87,7 @@ func newRTSPServer(
 	pathManager *pathManager,
 	parent rtspServerParent,
 ) (*rtspServer, error) {
-	ctx, ctxCancel := context.WithCancel(parentCtx)
+	ctx, ctxCancel := context.WithCancel(context.Background())
 
 	s := &rtspServer{
 		authMethods:         authMethods,
@@ -109,12 +108,11 @@ func newRTSPServer(
 	}
 
 	s.srv = &gortsplib.Server{
-		Handler:          s,
-		ReadTimeout:      time.Duration(readTimeout),
-		WriteTimeout:     time.Duration(writeTimeout),
-		ReadBufferCount:  readBufferCount,
-		WriteBufferCount: readBufferCount,
-		RTSPAddress:      address,
+		Handler:        s,
+		ReadTimeout:    time.Duration(readTimeout),
+		WriteTimeout:   time.Duration(writeTimeout),
+		WriteQueueSize: writeQueueSize,
+		RTSPAddress:    address,
 	}
 
 	if useUDP {
@@ -146,9 +144,9 @@ func newRTSPServer(
 
 	if metrics != nil {
 		if !isTLS {
-			metrics.rtspServerSet(s)
+			metrics.setRTSPServer(s)
 		} else {
-			metrics.rtspsServerSet(s)
+			metrics.setRTSPSServer(s)
 		}
 	}
 
@@ -166,6 +164,14 @@ func (s *rtspServer) Log(level logger.Level, format string, args ...interface{})
 		return "RTSP"
 	}()
 	s.parent.Log(level, "[%s] "+format, append([]interface{}{label}, args...)...)
+}
+
+func (s *rtspServer) getISTLS() bool {
+	return s.isTLS
+}
+
+func (s *rtspServer) getServer() *gortsplib.Server {
+	return s.srv
 }
 
 func (s *rtspServer) close() {
@@ -198,9 +204,9 @@ outer:
 
 	if s.metrics != nil {
 		if !s.isTLS {
-			s.metrics.rtspServerSet(nil)
+			s.metrics.setRTSPServer(nil)
 		} else {
-			s.metrics.rtspsServerSet(nil)
+			s.metrics.setRTSPSServer(nil)
 		}
 	}
 }
@@ -322,6 +328,12 @@ func (s *rtspServer) OnPacketLost(ctx *gortsplib.ServerHandlerOnPacketLostCtx) {
 func (s *rtspServer) OnDecodeError(ctx *gortsplib.ServerHandlerOnDecodeErrorCtx) {
 	se := ctx.Session.UserData().(*rtspSession)
 	se.onDecodeError(ctx)
+}
+
+// OnDecodeError implements gortsplib.ServerHandlerOnStreamWriteError.
+func (s *rtspServer) OnStreamWriteError(ctx *gortsplib.ServerHandlerOnStreamWriteErrorCtx) {
+	se := ctx.Session.UserData().(*rtspSession)
+	se.onStreamWriteError(ctx)
 }
 
 func (s *rtspServer) findConnByUUID(uuid uuid.UUID) *rtspConn {

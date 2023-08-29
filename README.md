@@ -14,35 +14,38 @@
 
 <br>
 
-_MediaMTX_ (formerly _rtsp-simple-server_) is a ready-to-use and zero-dependency real-time media server and media proxy that allows users to publish, read and proxy live video and audio streams. It has been conceived as a "media broker", a message broker that routes media streams.
+_MediaMTX_ (formerly _rtsp-simple-server_) is a ready-to-use and zero-dependency real-time media server and media proxy that allows users to publish, read and proxy live video and audio streams. It has been conceived as a "media broker", a message broker-like software that routes media streams.
 
 Live streams can be published to the server with:
 
 |protocol|variants|video codecs|audio codecs|
 |--------|--------|------------|------------|
-|[WebRTC](#webrtc)|Browser-based, WHIP|AV1, VP9, VP8, H264|Opus, G722, G711|
-|[RTSP clients](#rtsp-clients)|UDP, TCP, RTSPS|AV1, VP9, VP8, H265, H264, MPEG-4 Video (H263, Xvid), MPEG-1/2 Video, M-JPEG and any RTP-compatible codec|Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3), G722, G711, LPCM and any RTP-compatible codec|
-|[RTSP cameras and servers](#rtsp-cameras-and-servers)|UDP, UDP-Multicast, TCP, RTSPS|AV1, VP9, VP8, H265, H264, MPEG-4 Video (H263, Xvid), MPEG-1/2 Video, M-JPEG and any RTP-compatible codec|Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3), G722, G711, LPCM and any RTP-compatible codec|
-|[RTMP clients](#rtmp-clients)|RTMP, RTMPS, Enhanced RTMP|AV1, H265, H264|MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3)|
+|[SRT clients](#srt-clients)||H265, H264|Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3)|
+|[SRT servers](#srt-servers)||H265, H264|Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3)|
+|[WebRTC clients](#webrtc-clients)|Browser-based, WHIP|AV1, VP9, VP8, H264|Opus, G722, G711|
+|[WebRTC servers](#webrtc-servers)|WHEP|AV1, VP9, VP8, H264|Opus, G722, G711|
+|[RTSP clients](#rtsp-clients)|UDP, TCP, RTSPS|AV1, VP9, VP8, H265, H264, MPEG-4 Video (H263, Xvid), MPEG-1/2 Video, M-JPEG and any RTP-compatible codec|Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3), G726, G722, G711, LPCM and any RTP-compatible codec|
+|[RTSP cameras and servers](#rtsp-cameras-and-servers)|UDP, UDP-Multicast, TCP, RTSPS|AV1, VP9, VP8, H265, H264, MPEG-4 Video (H263, Xvid), MPEG-1/2 Video, M-JPEG and any RTP-compatible codec|Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3), G726, G722, G711, LPCM and any RTP-compatible codec|
+|[RTMP clients](#rtmp-clients)|RTMP, RTMPS, Enhanced RTMP|AV1, VP9, H265, H264|MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3)|
 |[RTMP cameras and servers](#rtmp-cameras-and-servers)|RTMP, RTMPS, Enhanced RTMP|H264|MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3)|
-|[HLS cameras and servers](#hls-cameras-and-servers)|Low-Latency HLS, MP4-based HLS, legacy HLS|H265, H264|Opus, MPEG-4 Audio (AAC)|
-|[UDP/MPEG-TS](#udpmpeg-ts)|Unicast, broadcast, multicast|H265, H264|Opus, MPEG-4 Audio (AAC)|
+|[HLS cameras and servers](#hls-cameras-and-servers)|Low-Latency HLS, MP4-based HLS, legacy HLS|AV1, VP9, H265, H264|Opus, MPEG-4 Audio (AAC)|
+|[UDP/MPEG-TS](#udpmpeg-ts)|Unicast, broadcast, multicast|H265, H264|Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3)|
 |[Raspberry Pi Cameras](#raspberry-pi-cameras)||H264||
 
 And can be read from the server with:
 
 |protocol|variants|video codecs|audio codecs|
 |--------|--------|------------|------------|
-|[WebRTC](#webrtc-1)|Browser-based, WHEP|AV1, VP9, VP8, H264|Opus, G722, G711|
-|[RTSP](#rtsp)|UDP, UDP-Multicast, TCP, RTSPS|AV1, VP9, VP8, H265, H264, MPEG-4 Video (H263, Xvid), MPEG-1/2 Video, M-JPEG and any RTP-compatible codec|Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3), G722, G711, LPCM and any RTP-compatible codec|
+|[SRT](#srt)||H265, H264|Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3)|
+|[WebRTC](#webrtc)|Browser-based, WHEP|AV1, VP9, VP8, H264|Opus, G722, G711|
+|[RTSP](#rtsp)|UDP, UDP-Multicast, TCP, RTSPS|AV1, VP9, VP8, H265, H264, MPEG-4 Video (H263, Xvid), MPEG-1/2 Video, M-JPEG and any RTP-compatible codec|Opus, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3), G726, G722, G711, LPCM and any RTP-compatible codec|
 |[RTMP](#rtmp)|RTMP, RTMPS, Enhanced RTMP|H264|MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3)|
-|[HLS](#hls)|Low-Latency HLS, MP4-based HLS, legacy HLS|H265, H264|Opus, MPEG-4 Audio (AAC)|
+|[HLS](#hls)|Low-Latency HLS, MP4-based HLS, legacy HLS|AV1, VP9, H265, H264|Opus, MPEG-4 Audio (AAC)|
 
 **Features**
 
 * Publish live streams to the server
 * Read live streams from the server
-* Proxy streams from other servers or cameras, always or on-demand
 * Streams are automatically converted from a protocol to another. For instance, it's possible to publish a stream with RTSP and read it with HLS
 * Serve multiple streams at once in separate paths
 * Authenticate users; use internal or external authentication
@@ -76,7 +79,10 @@ _rtsp-simple-server_ has been rebranded as _MediaMTX_. The reason is pretty obvi
     * [Generic webcam](#generic-webcam)
     * [Raspberry Pi Cameras](#raspberry-pi-cameras)
   * [By protocol](#by-protocol)
-    * [WebRTC](#webrtc)
+    * [SRT clients](#srt-clients)
+    * [SRT servers](#srt-servers)
+    * [WebRTC clients](#webrtc-clients)
+    * [WebRTC servers](#webrtc-servers)
     * [RTSP clients](#rtsp-clients)
     * [RTSP cameras and servers](#rtsp-cameras-and-servers)
     * [RTMP clients](#rtmp-clients)
@@ -90,21 +96,24 @@ _rtsp-simple-server_ has been rebranded as _MediaMTX_. The reason is pretty obvi
     * [VLC](#vlc)
     * [Web browsers](#web-browsers-1)
   * [By protocol](#by-protocol-1)
-    * [WebRTC](#webrtc-1)
+    * [SRT](#srt)
+    * [WebRTC](#webrtc)
     * [RTSP](#rtsp)
     * [RTMP](#rtmp)
     * [HLS](#hls)
-* [Features](#features)
+* [Other features](#other-features)
   * [Configuration](#configuration)
   * [Authentication](#authentication)
   * [Encrypt the configuration](#encrypt-the-configuration)
   * [Remuxing, re-encoding, compression](#remuxing-re-encoding-compression)
   * [Save streams to disk](#save-streams-to-disk)
+  * [Forward streams to another server](#forward-streams-to-another-server)
   * [On-demand publishing](#on-demand-publishing)
   * [Start on boot](#start-on-boot)
   * [RTSP-specific features](#rtsp-specific-features)
     * [Transport protocols](#transport-protocols)
     * [Encryption](#encryption)
+    * [Corrupted frames](#corrupted-frames)
   * [RTMP-specific features](#rtmp-specific-features)
     * [Encryption](#encryption-1)
   * [WebRTC-specific features](#webrtc-specific-features)
@@ -156,6 +165,7 @@ docker run --rm -it \
 -p 1935:1935 \
 -p 8888:8888 \
 -p 8889:8889 \
+-p 8890:8890/udp \
 bluenviron/mediamtx
 ```
 
@@ -214,7 +224,8 @@ makepkg -si
    or _GStreamer_:
 
    ```sh
-   gst-launch-1.0 rtspclientsink name=s location=rtsp://localhost:8554/mystream filesrc location=file.mp4 ! qtdemux name=d d.video_0 ! queue ! s.sink_0 d.audio_0 ! queue ! s.sink_1
+   gst-launch-1.0 rtspclientsink name=s location=rtsp://localhost:8554/mystream filesrc location=file.mp4 \
+   ! qtdemux name=d d.video_0 ! queue ! s.sink_0 d.audio_0 ! queue ! s.sink_1
    ```
 
 2. Open the stream. For instance, you can open the stream with _VLC_:
@@ -241,7 +252,7 @@ makepkg -si
 
 #### FFmpeg
 
-FFmpeg can publish a stream to the server in multiple ways (RTSP client, RTMP client, UDP/MPEG-TS, WebRTC with WHIP). The recommended one consists in publishing as a [RTSP client](#rtsp-clients):
+FFmpeg can publish a stream to the server in multiple ways (SRT client, SRT server, RTSP client, RTMP client, UDP/MPEG-TS, WebRTC with WHIP). The recommended one consists in publishing as a [RTSP client](#rtsp-clients):
 
 ```
 ffmpeg -re -stream_loop -1 -i file.ts -c copy -f rtsp rtsp://localhost:8554/mystream
@@ -257,29 +268,34 @@ The resulting stream will be available in path `/mystream`.
 
 #### GStreamer
 
-GStreamer can publish a stream to the server in multiple ways (RTSP client, RTMP client, UDP/MPEG-TS, WebRTC with WHIP). The recommended one consists in publishing as a [RTSP client](#rtsp-clients):
+GStreamer can publish a stream to the server in multiple ways (SRT client, SRT server, RTSP client, RTMP client, UDP/MPEG-TS, WebRTC with WHIP). The recommended one consists in publishing as a [RTSP client](#rtsp-clients):
 
 ```sh
-gst-launch-1.0 rtspclientsink name=s location=rtsp://localhost:8554/mystream filesrc location=file.mp4 ! qtdemux name=d d.video_0 ! queue ! s.sink_0 d.audio_0 ! queue ! s.sink_1
+gst-launch-1.0 rtspclientsink name=s location=rtsp://localhost:8554/mystream \
+filesrc location=file.mp4 ! qtdemux name=d \
+d.video_0 ! queue ! s.sink_0 \
+d.audio_0 ! queue ! s.sink_1
 ```
 
 If the stream is video only:
 
 ```sh
-gst-launch-1.0 filesrc location=file.mp4 ! qtdemux name=d d.video_0 ! rtspclientsink name=s location=rtsp://localhost:8554/mystream
+gst-launch-1.0 filesrc location=file.mp4 ! qtdemux name=d \
+d.video_0 ! rtspclientsink location=rtsp://localhost:8554/mystream
 ```
 
 The RTSP protocol supports multiple underlying transport protocols, each with its own characteristics (see [RTSP-specific features](#rtsp-specific-features)). You can set the transport protocol by using the `protocols` flag:
 
 ```sh
-gst-launch-1.0 filesrc location=file.mp4 ! qtdemux name=d d.video_0 ! rtspclientsink protocols=tcp name=s location=rtsp://localhost:8554/mystream
+gst-launch-1.0 filesrc location=file.mp4 ! qtdemux name=d \
+d.video_0 ! rtspclientsink protocols=tcp name=s location=rtsp://localhost:8554/mystream
 ```
 
 The resulting stream will be available in path `/mystream`.
 
 #### OBS Studio
 
-OBS Studio can publish to the server as a [RTMP client](#rtmp-clients). In `Settings -> Stream` (or in the Auto-configuration Wizard), use the following parameters:
+OBS Studio can publish to the server in multiple ways (SRT client, RTMP client, WebRTC client). The recommended one consists in publishing as a [RTMP client](#rtmp-clients). In `Settings -> Stream` (or in the Auto-configuration Wizard), use the following parameters:
 
 * Service: `Custom...`
 * Server: `rtmp://localhost`
@@ -317,7 +333,7 @@ The resulting stream will be available in path `/mystream`.
 
 #### OpenCV
 
-OpenCV can publish to the server as a [RTSP client](#rtsp-clients). It must be compiled with GStreamer support, by following this procedure:
+OpenCV can publish to the server through its GStreamer plugin, as a [RTSP client](#rtsp-clients). It must be compiled with GStreamer support, by following this procedure:
 
 ```sh
 sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-ugly gstreamer1.0-rtsp python3-dev python3-numpy
@@ -340,9 +356,11 @@ Check that the output contains `GStreamer: YES`.
 Videos can be published with `VideoWriter`:
 
 ```python
+from datetime import datetime
+from time import sleep, time
+
 import cv2
 import numpy as np
-from time import sleep, time
 
 fps = 15
 width = 800
@@ -354,6 +372,7 @@ colors = [
 ]
 
 out = cv2.VideoWriter('appsrc ! videoconvert' + \
+    ' ! video/x-raw,format=I420' + \
     ' ! x264enc speed-preset=ultrafast bitrate=600 key-int-max=' + str(fps * 2) + \
     ' ! video/x-h264,profile=baseline' + \
     ' ! rtspclientsink location=rtsp://localhost:8554/mystream',
@@ -376,7 +395,7 @@ while True:
             frame[y][x] = color
 
     out.write(frame)
-    print("frame written to the server")
+    print("%s frame written to the server" % datetime.now())
 
     now = time()
     diff = (1 / fps) - now - start
@@ -447,7 +466,7 @@ If you want to run the standard (non-Docker) version of the server:
 
 1. Make sure that the following packages are installed:
 
-   * `libcamera0` (at least version 0.0.2)
+   * `libcamera0` (&ge; 0.0.5)
    * `libfreetype6`
 
 2. download the server executable. If you're using 64-bit version of the operative system, make sure to pick the `arm64` variant.
@@ -528,7 +547,38 @@ The resulting stream will be available in path `/cam_with_audio`.
 
 ### By protocol
 
-#### WebRTC
+#### SRT clients
+
+SRT is a protocol that allows to publish and read live data stream, providing encryption, integrity and a retransmission mechanism. It is usually used to transfer media streams encoded with MPEG-TS. In order to publish a stream to the server with the SRT protocol, use this URL:
+
+```
+srt://localhost:8890?streamid=publish:mystream&pkt_size=1316
+```
+
+Replace `mystream` with any name you want. The resulting stream will be available in path `/mystream`.
+
+If credentials are enabled, append username and password to `streamid`;
+
+```
+srt://localhost:8890?streamid=publish:mystream:user:pass&pkt_size=1316
+```
+
+If you want to publish a stream by using a client in listening mode (i.e. with `mode=listener` appended to the URL), read the next section.
+
+Known clients that can publish with SRT are [FFmpeg](#ffmpeg), [GStreamer](#gstreamer), [OBS Studio](#obs-studio).
+
+#### SRT servers
+
+In order to ingest into the server a SRT stream from an existing server, camera or client in listening mode (i.e. with `mode=listener` appended to the URL), add the corresponding URL into the `source` parameter of a path:
+
+```yml
+paths:
+  proxied:
+    # url of the source stream, in the format srt://host:port?streamid=streamid&other_parameters
+    source: srt://original-url
+```
+
+#### WebRTC clients
 
 WebRTC is an API that makes use of a set of protocols and methods to connect two clients together and allow them to exchange real-time media or data streams. You can publish a stream with WebRTC and a web browser by visiting:
 
@@ -546,15 +596,30 @@ http://localhost:8889/mystream/whip
 
 Depending on the network it may be difficult to establish a connection between server and clients, see [WebRTC-specific features](#webrtc-specific-features) for remediations.
 
+Known clients that can publish with WebRTC and WHIP are [FFmpeg](#ffmpeg), [GStreamer](#gstreamer), [OBS Studio](#obs-studio).
+
+#### WebRTC servers
+
+In order to ingest into the server a WebRTC stream from an existing server, add the corresponding WHEP URL into the `source` parameter of a path:
+
+```yml
+paths:
+  proxied:
+    # url of the source stream, in the format whep://host:port/path (HTTP) or wheps:// (HTTPS)
+    source: wheps://host:port/path
+```
+
 #### RTSP clients
 
-RTSP is a protocol that allows to publish and read streams. It supports different underlying transport protocols and allows to encrypt streams in transit (see [RTSP-specific features](#rtsp-specific-features)). In order to publish a stream with the RTSP protocol, you can use this URL:
+RTSP is a protocol that allows to publish and read streams. It supports different underlying transport protocols and allows to encrypt streams in transit (see [RTSP-specific features](#rtsp-specific-features)). In order to publish a stream to the server with the RTSP protocol, use this URL:
 
 ```
 rtsp://localhost:8554/mystream
 ```
 
 The resulting stream will be available in path `/mystream`.
+
+Known clients that can publish with RTSP are [FFmpeg](#ffmpeg), [GStreamer](#gstreamer), [OBS Studio](#obs-studio).
 
 #### RTSP cameras and servers
 
@@ -590,6 +655,14 @@ rtmp://localhost/mystream
 
 The resulting stream will be available in path `/mystream`.
 
+In case authentication is enabled, credentials can be passed to the server by using the `user` and `pass` query parameters:
+
+```
+rtmp://localhost/mystream?user=myuser&pass=mypass
+```
+
+Known clients that can publish with RTMP are [FFmpeg](#ffmpeg), [GStreamer](#gstreamer), [OBS Studio](#obs-studio).
+
 #### RTMP cameras and servers
 
 You can use _MediaMTX_ to connect to one or multiple existing RTMP servers and read their video streams:
@@ -622,19 +695,29 @@ The server supports ingesting UDP/MPEG-TS packets (i.e. MPEG-TS packets sent wit
 
 ```
 gst-launch-1.0 -v mpegtsmux name=mux alignment=1 ! udpsink host=238.0.0.1 port=1234 \
-videotestsrc ! video/x-raw,width=1280,height=720 ! x264enc speed-preset=ultrafast bitrate=3000 key-int-max=60 ! video/x-h264,profile=high ! mux. \
+videotestsrc ! video/x-raw,width=1280,height=720,format=I420 ! x264enc speed-preset=ultrafast bitrate=3000 key-int-max=60 ! video/x-h264,profile=high ! mux. \
 audiotestsrc ! audioconvert ! avenc_aac ! mux.
+```
+
+or FFmpeg:
+
+```
+ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 \
+-pix_fmt yuv420p -c:v libx264 -preset ultrafast -b:v 600k \
+-f mpegts udp://238.0.0.1:1234?pkt_size=1316
 ```
 
 Edit `mediamtx.yml` and replace everything inside section `paths` with the following content:
 
 ```yml
 paths:
-  udp:
+  mypath:
     source: udp://238.0.0.1:1234
 ```
 
-The resulting stream will be available in path `/udp`.
+The resulting stream will be available in path `/mypath`.
+
+Known clients that can publish with WebRTC and WHIP are [FFmpeg](#ffmpeg) and [GStreamer](#gstreamer).
 
 ## Read from the server
 
@@ -642,7 +725,7 @@ The resulting stream will be available in path `/udp`.
 
 #### FFmpeg
 
-FFmpeg can read a stream from the server in multiple ways (RTSP, RTMP, HLS, WebRTC with WHEP). The recommended one consists in reading with [RTSP](#rtsp):
+FFmpeg can read a stream from the server in multiple ways (RTSP, RTMP, HLS, WebRTC with WHEP, SRT). The recommended one consists in reading with [RTSP](#rtsp):
 
 ```sh
 ffmpeg -i rtsp://localhost:8554/mystream -c copy output.mp4
@@ -656,7 +739,7 @@ ffmpeg -rtsp_transport tcp -i rtsp://localhost:8554/mystream -c copy output.mp4
 
 #### GStreamer
 
-GStreamer can read a stream from the server in multiple ways (RTSP, RTMP, HLS, WebRTC with WHEP). The recommended one consists in reading with [RTSP](#rtsp):
+GStreamer can read a stream from the server in multiple ways (RTSP, RTMP, HLS, WebRTC with WHEP, SRT). The recommended one consists in reading with [RTSP](#rtsp):
 
 ```sh
 gst-launch-1.0 rtspsrc location=rtsp://127.0.0.1:8554/mystream latency=0 ! decodebin ! autovideosink
@@ -676,7 +759,7 @@ gst-launch-1.0 rtspsrc tls-validation-flags=0 location=rtsps://ip:8322/...
 
 #### VLC
 
-VLC can read a stream from the server in multiple ways (RTSP, RTMP, HLS). The recommended one consists in reading with [RTSP](#rtsp):
+VLC can read a stream from the server in multiple ways (RTSP, RTMP, HLS, SRT). The recommended one consists in reading with [RTSP](#rtsp):
 
 ```sh
 vlc --network-caching=50 rtsp://localhost:8554/mystream
@@ -743,6 +826,24 @@ This web page can be embedded into another web page by using an iframe:
 
 ### By protocol
 
+#### SRT
+
+SRT is a protocol that allows to publish and read live data stream, providing encryption, integrity and a retransmission mechanism. It is usually used to transfer media streams encoded with MPEG-TS. In order to read a stream from the server with the SRT protocol, use this URL:
+
+```
+srt://localhost:8890?streamid=read:mystream
+```
+
+Replace `mystream` with the path name.
+
+If credentials are enabled, append username and password to `streamid`;
+
+```
+srt://localhost:8890?streamid=publish:mystream:user:pass
+```
+
+Known clients that can read with SRT are [FFmpeg](#ffmpeg-1), [GStreamer](#gstreamer-1) and [VLC](#vlc).
+
 #### WebRTC
 
 WebRTC is an API that makes use of a set of protocols and methods to connect two clients together and allow them to exchange real-time media or data streams. You can read a stream with WebRTC and a web browser by visiting:
@@ -759,13 +860,17 @@ http://localhost:8889/mystream/whep
 
 Depending on the network it may be difficult to establish a connection between server and clients, see [WebRTC-specific features](#webrtc-specific-features) for remediations.
 
+Known clients that can read with WebRTC and WHEP are [FFmpeg](#ffmpeg-1), [GStreamer](#gstreamer-1) and [web browsers](#web-browsers-1).
+
 #### RTSP
 
-RTSP is a protocol that allows to publish and read streams. It supports different underlying transport protocols and allows to encrypt streams in transit (see [RTSP-specific features](#rtsp-specific-features)). In order to read a stream with the RTSP protocol, you can use this URL:
+RTSP is a protocol that allows to publish and read streams. It supports different underlying transport protocols and allows to encrypt streams in transit (see [RTSP-specific features](#rtsp-specific-features)). In order to read a stream with the RTSP protocol, use this URL:
 
 ```
 rtsp://localhost:8554/mystream
 ```
+
+Known clients that can read with RTSP are [FFmpeg](#ffmpeg-1), [GStreamer](#gstreamer-1) and [VLC](#vlc).
 
 ##### Latency
 
@@ -775,33 +880,6 @@ The RTSP protocol doesn't introduce any latency by itself. Latency is usually in
 vlc --network-caching=50 rtsp://...
 ```
 
-##### Corrupted frames
-
-In some scenarios, when reading from the server with RTSP, decoded frames can be corrupted or incomplete. This can be caused by multiple reasons:
-
-* the packet buffer of the server is too small and can't keep up with the stream throughput. A solution consists in increasing its size:
-
-  ```yml
-  readBufferCount: 1024
-  ```
-
-* The stream throughput is too big and the stream can't be sent correctly with the UDP transport. UDP is more performant, faster and more efficient than TCP, but doesn't have a retransmission mechanism, that is needed in case of streams that need a large bandwidth. A solution consists in switching to TCP:
-
-  ```yml
-  protocols: [tcp]
-  ```
-
-  In case the source is a camera:
-
-  ```yml
-  paths:
-    test:
-      source: rtsp://..
-      sourceProtocol: tcp
-   ```
-
-* The stream throughput is too big to be handled by the network between server and readers. Upgrade the network or decrease the stream bitrate by re-encoding it.
-
 #### RTMP
 
 RTMP is a protocol that allows to read and publish streams, but is less versatile and less efficient than RTSP and WebRTC ((doesn't support UDP, doesn't support most RTSP codecs, doesn't support feedback mechanism)). Streams can be read from the server by using the URL:
@@ -809,6 +887,14 @@ RTMP is a protocol that allows to read and publish streams, but is less versatil
 ```
 rtmp://localhost/mystream
 ```
+
+In case authentication is enabled, credentials can be passed to the server by using the `user` and `pass` query parameters:
+
+```
+rtmp://localhost/mystream?user=myuser&pass=mypass
+```
+
+Known clients that can read with RTMP are [FFmpeg](#ffmpeg-1), [GStreamer](#gstreamer-1) and [VLC](#vlc).
 
 #### HLS
 
@@ -824,15 +910,20 @@ and can also be accessed without using the browsers, by software that supports t
 http://localhost:8888/mystream/index.m3u8
 ```
 
-Although the server can produce HLS with a variety of video and audio codecs (that are listed at the beginning of the README), not all browsers can read all codecs. You can check what codecs your browser can read by visiting this page:
+Although the server can produce HLS with a variety of video and audio codecs (that are listed at the beginning of the README), not all browsers can read all codecs.
 
-<https://jsfiddle.net/4msrhudv>
+You can check what codecs your browser can read by [using this tool](https://jsfiddle.net/g1qyf4ea).
 
 If you want to support most browsers, you can to re-encode the stream by using the H264 and AAC codecs, for instance by using FFmpeg:
 
 ```sh
-ffmpeg -i rtsp://original-source -pix_fmt yuv420p -c:v libx264 -preset ultrafast -b:v 600k -c:a aac -b:a 160k -f rtsp rtsp://localhost:8554/mystream
+ffmpeg -i rtsp://original-source \
+-pix_fmt yuv420p -c:v libx264 -preset ultrafast -b:v 600k \
+-c:a aac -b:a 160k \
+-f rtsp rtsp://localhost:8554/mystream
 ```
+
+Known clients that can read with HLS are [FFmpeg](#ffmpeg-1), [GStreamer](#gstreamer-1), [VLC](#vlc) and [web browsers](#web-browsers-1).
 
 ##### LL-HLS
 
@@ -885,7 +976,7 @@ To decrease the latency, you can:
     ffmpeg -i rtsp://original-stream -pix_fmt yuv420p -c:v libx264 -preset ultrafast -b:v 600k -max_muxing_queue_size 1024 -g 30 -f rtsp rtsp://localhost:$RTSP_PORT/compressed
     ```
 
-## Features
+## Other features
 
 ### Configuration
 
@@ -1038,22 +1129,42 @@ To change the format, codec or compression of a stream, use _FFmpeg_ or _GStream
 paths:
   all:
   original:
-    runOnReady: ffmpeg -i rtsp://localhost:$RTSP_PORT/$MTX_PATH -pix_fmt yuv420p -c:v libx264 -preset ultrafast -b:v 600k -max_muxing_queue_size 1024 -f rtsp rtsp://localhost:$RTSP_PORT/compressed
+    runOnReady: >
+      ffmpeg -i rtsp://localhost:$RTSP_PORT/$MTX_PATH
+        -pix_fmt yuv420p -c:v libx264 -preset ultrafast -b:v 600k
+        -max_muxing_queue_size 1024 -f rtsp rtsp://localhost:$RTSP_PORT/compressed
     runOnReadyRestart: yes
 ```
 
 ### Save streams to disk
 
-To save available streams to disk, you can use the `runOnReady` parameter and _FFmpeg_:
+To save available streams to disk, use _FFmpeg_ inside the `runOnReady` parameter:
 
 ```yml
 paths:
-  mypath:
-    runOnReady: ffmpeg -i rtsp://localhost:$RTSP_PORT/$MTX_PATH -c copy -f segment -strftime 1 -segment_time 60 -segment_format mpegts saved_%Y-%m-%d_%H-%M-%S.ts
+  all:
+    runOnReady: >
+      ffmpeg -i rtsp://localhost:$RTSP_PORT/$MTX_PATH
+      -c copy
+      -f segment -strftime 1 -segment_time 60 -segment_format mpegts saved_%Y-%m-%d_%H-%M-%S.ts
     runOnReadyRestart: yes
 ```
 
-In the configuratio above, streams are saved into TS files, that can be read even if the system crashes, while MP4 files can't.
+In the configuration above, streams are saved in MPEG-TS format, that is resilient to system crashes.
+
+### Forward streams to another server
+
+To forward incoming streams to another server, use _FFmpeg_ inside the `runOnReady` parameter:
+
+```yml
+paths:
+  all:
+    runOnReady: >
+      ffmpeg -i rtsp://localhost:$RTSP_PORT/$MTX_PATH
+      -c copy
+      -f rtsp rtsp://another-server/another-path
+    runOnReadyRestart: yes
+```
 
 ### On-demand publishing
 
@@ -1161,6 +1272,33 @@ Streams can be published and read with the `rtsps` scheme and the `8322` port:
 rtsps://localhost:8322/mystream
 ```
 
+#### Corrupted frames
+
+In some scenarios, when publishing or reading from the server with RTSP, frames can get corrupted. This can be caused by multiple reasons:
+
+* the write queue of the server is too small and can't keep up with the stream throughput. A solution consists in increasing its size:
+
+  ```yml
+  writeQueueSize: 1024
+  ```
+
+* The stream throughput is too big and the stream can't be transmitted correctly with the UDP transport protocol. UDP is more performant, faster and more efficient than TCP, but doesn't have a retransmission mechanism, that is needed in case of streams that need a large bandwidth. A solution consists in switching to TCP:
+
+  ```yml
+  protocols: [tcp]
+  ```
+
+  In case the source is a camera:
+
+  ```yml
+  paths:
+    test:
+      source: rtsp://..
+      sourceProtocol: tcp
+   ```
+
+* The stream throughput is too big to be handled by the network between server and readers. Upgrade the network or decrease the stream bitrate by re-encoding it.
+
 ### RTMP-specific features
 
 #### Encryption
@@ -1218,7 +1356,7 @@ If the UDP protocol is blocked by a firewall, all WebRTC/ICE connections can be 
 # public IP of the server
 webrtcICEHostNAT1To1IPs: [192.168.x.x]
 # any port of choice
-webrtcICETCPPMuxAddress: :8189
+webrtcICETCPMuxAddress: :8189
 ```
 
 The NAT / container must then be configured in order to redirect all incoming TCP packets on port 8189 to the server. If you're using Docker, this can be achieved with the flag:
@@ -1348,7 +1486,6 @@ The server can be compiled with native support for the Raspberry Pi Camera. Comp
 * `libcamera-dev`
 * `libfreetype-dev`
 * `xxd`
-* `patchelf`
 
 Download the repository, open a terminal in it and run:
 
@@ -1374,24 +1511,30 @@ The command will produce tarballs in folder `binaries/`.
 ## Standards
 
 * RTSP
+
   * [RTSP / RTP / RTCP standards](https://github.com/bluenviron/gortsplib#standards)
 
 * HLS
+
   * [HLS standards](https://github.com/bluenviron/gohlslib#standards)
 
 * RTMP
+
   * [RTMP](https://rtmp.veriskope.com/pdf/rtmp_specification_1.0.pdf)
   * [Enhanced RTMP](https://raw.githubusercontent.com/veovera/enhanced-rtmp/main/enhanced-rtmp-v1.pdf)
 
 * WebRTC
+
   * [WebRTC: Real-Time Communication in Browsers](https://www.w3.org/TR/webrtc/)
   * [WebRTC HTTP Ingestion Protocol (WHIP)](https://datatracker.ietf.org/doc/draft-ietf-wish-whip/)
   * [WebRTC HTTP Egress Protocol (WHEP)](https://datatracker.ietf.org/doc/draft-murillo-whep/)
 
 * Video and audio codecs
+
   * [Codec standards](https://github.com/bluenviron/mediacommon#standards)
 
 * Other
+
   * [Golang project layout](https://github.com/golang-standards/project-layout)
 
 ## Related projects
@@ -1399,6 +1542,7 @@ The command will produce tarballs in folder `binaries/`.
 * [gortsplib (RTSP library used internally)](https://github.com/bluenviron/gortsplib)
 * [gohlslib (HLS library used internally)](https://github.com/bluenviron/gohlslib)
 * [mediacommon (codecs and formats library used internally)](https://github.com/bluenviron/mediacommon)
+* [datarhei/gosrt (SRT library used internally)](https://github.com/datarhei/gosrt)
 * [pion/webrtc (WebRTC library used internally)](https://github.com/pion/webrtc)
 * [pion/sdp (SDP library used internally)](https://github.com/pion/sdp)
 * [pion/rtp (RTP library used internally)](https://github.com/pion/rtp)
@@ -1406,3 +1550,4 @@ The command will produce tarballs in folder `binaries/`.
 * [notedit/rtmp (RTMP library used internally)](https://github.com/notedit/rtmp)
 * [go-astits (MPEG-TS library used internally)](https://github.com/asticode/go-astits)
 * [go-mp4 (MP4 library used internally)](https://github.com/abema/go-mp4)
+* [hls.js (browser-side HLS library used internally)](https://github.com/video-dev/hls.js)

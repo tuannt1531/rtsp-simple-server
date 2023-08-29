@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
@@ -13,10 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/media"
+	"github.com/bluenviron/gortsplib/v4"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
+	"github.com/bluenviron/mediacommon/pkg/formats/mpegts"
+	"github.com/datarhei/gosrt"
 	"github.com/google/uuid"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
@@ -24,7 +27,7 @@ import (
 	"github.com/bluenviron/mediamtx/internal/rtmp"
 )
 
-var testFormatH264 = &formats.H264{
+var testFormatH264 = &format.H264{
 	PayloadTyp: 96,
 	SPS: []byte{ // 1920x1080 baseline
 		0x67, 0x42, 0xc0, 0x28, 0xd9, 0x00, 0x78, 0x02,
@@ -35,9 +38,9 @@ var testFormatH264 = &formats.H264{
 	PacketizationMode: 1,
 }
 
-var testMediaH264 = &media.Media{
-	Type:    media.TypeVideo,
-	Formats: []formats.Format{testFormatH264},
+var testMediaH264 = &description.Media{
+	Type:    description.MediaTypeVideo,
+	Formats: []format.Format{testFormatH264},
 }
 
 func httpRequest(t *testing.T, hc *http.Client, method string, ur string, in interface{}, out interface{}) {
@@ -123,7 +126,7 @@ func TestAPIConfigSet(t *testing.T) {
 	hc := &http.Client{Transport: &http.Transport{}}
 
 	httpRequest(t, hc, http.MethodPost, "http://localhost:9997/v2/config/set", map[string]interface{}{
-		"rtmpDisable": true,
+		"rtmp":        false,
 		"readTimeout": "7s",
 		"protocols":   []string{"tcp"},
 	}, nil)
@@ -132,7 +135,7 @@ func TestAPIConfigSet(t *testing.T) {
 
 	var out map[string]interface{}
 	httpRequest(t, hc, http.MethodGet, "http://localhost:9997/v2/config/get", nil, &out)
-	require.Equal(t, true, out["rtmpDisable"])
+	require.Equal(t, false, out["rtmp"])
 	require.Equal(t, "7s", out["readTimeout"])
 	require.Equal(t, []interface{}{"tcp"}, out["protocols"])
 }
@@ -217,7 +220,7 @@ func TestAPIPathsList(t *testing.T) {
 	type path struct {
 		Name          string     `json:"name"`
 		Source        pathSource `json:"source"`
-		SourceReady   bool       `json:"sourceReady"`
+		Ready         bool       `json:"ready"`
 		Tracks        []string   `json:"tracks"`
 		BytesReceived uint64     `json:"bytesReceived"`
 	}
@@ -242,11 +245,11 @@ func TestAPIPathsList(t *testing.T) {
 		source := gortsplib.Client{}
 		err := source.StartRecording(
 			"rtsp://localhost:8554/mypath",
-			media.Medias{
+			&description.Session{Medias: []*description.Media{
 				media0,
 				{
-					Type: media.TypeAudio,
-					Formats: []formats.Format{&formats.MPEG4Audio{
+					Type: description.MediaTypeAudio,
+					Formats: []format.Format{&format.MPEG4Audio{
 						PayloadTyp: 96,
 						Config: &mpeg4audio.Config{
 							Type:         2,
@@ -258,17 +261,18 @@ func TestAPIPathsList(t *testing.T) {
 						IndexDeltaLength: 3,
 					}},
 				},
-			})
+			}})
 		require.NoError(t, err)
 		defer source.Close()
 
-		source.WritePacketRTP(media0, &rtp.Packet{
+		err = source.WritePacketRTP(media0, &rtp.Packet{
 			Header: rtp.Header{
 				Version:     2,
 				PayloadType: 96,
 			},
-			Payload: []byte{0x01, 0x02, 0x03, 0x04},
+			Payload: []byte{5, 1, 2, 3, 4},
 		})
+		require.NoError(t, err)
 
 		var out pathList
 		httpRequest(t, hc, http.MethodGet, "http://localhost:9997/v2/paths/list", nil, &out)
@@ -280,9 +284,9 @@ func TestAPIPathsList(t *testing.T) {
 				Source: pathSource{
 					Type: "rtspSession",
 				},
-				SourceReady:   true,
+				Ready:         true,
 				Tracks:        []string{"H264", "MPEG-4 Audio"},
-				BytesReceived: 16,
+				BytesReceived: 17,
 			}},
 		}, out)
 	})
@@ -307,29 +311,28 @@ func TestAPIPathsList(t *testing.T) {
 
 		hc := &http.Client{Transport: &http.Transport{}}
 
-		medias := media.Medias{
-			{
-				Type:    media.TypeVideo,
-				Formats: []formats.Format{testFormatH264},
-			},
-			{
-				Type: media.TypeAudio,
-				Formats: []formats.Format{&formats.MPEG4Audio{
-					PayloadTyp: 97,
-					Config: &mpeg4audio.Config{
-						Type:         2,
-						SampleRate:   44100,
-						ChannelCount: 2,
-					},
-					SizeLength:       13,
-					IndexLength:      3,
-					IndexDeltaLength: 3,
-				}},
-			},
-		}
-
 		source := gortsplib.Client{TLSConfig: &tls.Config{InsecureSkipVerify: true}}
-		err = source.StartRecording("rtsps://localhost:8322/mypath", medias)
+		err = source.StartRecording("rtsps://localhost:8322/mypath",
+			&description.Session{Medias: []*description.Media{
+				{
+					Type:    description.MediaTypeVideo,
+					Formats: []format.Format{testFormatH264},
+				},
+				{
+					Type: description.MediaTypeAudio,
+					Formats: []format.Format{&format.MPEG4Audio{
+						PayloadTyp: 97,
+						Config: &mpeg4audio.Config{
+							Type:         2,
+							SampleRate:   44100,
+							ChannelCount: 2,
+						},
+						SizeLength:       13,
+						IndexLength:      3,
+						IndexDeltaLength: 3,
+					}},
+				},
+			}})
 		require.NoError(t, err)
 		defer source.Close()
 
@@ -343,8 +346,8 @@ func TestAPIPathsList(t *testing.T) {
 				Source: pathSource{
 					Type: "rtspsSession",
 				},
-				SourceReady: true,
-				Tracks:      []string{"H264", "MPEG-4 Audio"},
+				Ready:  true,
+				Tracks: []string{"H264", "MPEG-4 Audio"},
 			}},
 		}, out)
 	})
@@ -370,8 +373,8 @@ func TestAPIPathsList(t *testing.T) {
 				Source: pathSource{
 					Type: "rtspSource",
 				},
-				SourceReady: false,
-				Tracks:      []string{},
+				Ready:  false,
+				Tracks: []string{},
 			}},
 		}, out)
 	})
@@ -397,8 +400,8 @@ func TestAPIPathsList(t *testing.T) {
 				Source: pathSource{
 					Type: "rtmpSource",
 				},
-				SourceReady: false,
-				Tracks:      []string{},
+				Ready:  false,
+				Tracks: []string{},
 			}},
 		}, out)
 	})
@@ -424,8 +427,8 @@ func TestAPIPathsList(t *testing.T) {
 				Source: pathSource{
 					Type: "hlsSource",
 				},
-				SourceReady: false,
-				Tracks:      []string{},
+				Ready:  false,
+				Tracks: []string{},
 			}},
 		}, out)
 	})
@@ -440,12 +443,7 @@ func TestAPIPathsGet(t *testing.T) {
 
 	hc := &http.Client{Transport: &http.Transport{}}
 
-	source := gortsplib.Client{}
-	err := source.StartRecording("rtsp://localhost:8554/mypath", media.Medias{testMediaH264})
-	require.NoError(t, err)
-	defer source.Close()
-
-	for _, ca := range []string{"ok", "not found"} {
+	for _, ca := range []string{"ok", "ok-nested", "not found"} {
 		t.Run(ca, func(t *testing.T) {
 			type pathSource struct {
 				Type string `json:"type"`
@@ -454,28 +452,38 @@ func TestAPIPathsGet(t *testing.T) {
 			type path struct {
 				Name          string     `json:"name"`
 				Source        pathSource `json:"source"`
-				SourceReady   bool       `json:"sourceReady"`
+				Ready         bool       `json:"Ready"`
 				Tracks        []string   `json:"tracks"`
 				BytesReceived uint64     `json:"bytesReceived"`
 			}
 
 			var pathName string
-			if ca == "ok" {
+
+			switch ca {
+			case "ok":
 				pathName = "mypath"
-			} else {
+			case "ok-nested":
+				pathName = "my/nested/path"
+			case "not found":
 				pathName = "nonexisting"
 			}
 
-			if ca == "ok" {
+			if ca == "ok" || ca == "ok-nested" {
+				source := gortsplib.Client{}
+				err := source.StartRecording("rtsp://localhost:8554/"+pathName,
+					&description.Session{Medias: []*description.Media{testMediaH264}})
+				require.NoError(t, err)
+				defer source.Close()
+
 				var out path
 				httpRequest(t, hc, http.MethodGet, "http://localhost:9997/v2/paths/get/"+pathName, nil, &out)
 				require.Equal(t, path{
-					Name: "mypath",
+					Name: pathName,
 					Source: pathSource{
 						Type: "rtspSession",
 					},
-					SourceReady: true,
-					Tracks:      []string{"H264"},
+					Ready:  true,
+					Tracks: []string{"H264"},
 				}, out)
 			} else {
 				res, err := hc.Get("http://localhost:9997/v2/paths/get/" + pathName)
@@ -505,6 +513,7 @@ func TestAPIProtocolList(t *testing.T) {
 		"rtmps",
 		"hls",
 		"webrtc",
+		"srt",
 	} {
 		t.Run(ca, func(t *testing.T) {
 			conf := "api: yes\n"
@@ -537,7 +546,8 @@ func TestAPIProtocolList(t *testing.T) {
 			case "rtsp conns", "rtsp sessions":
 				source := gortsplib.Client{}
 
-				err := source.StartRecording("rtsp://localhost:8554/mypath", media.Medias{medi})
+				err := source.StartRecording("rtsp://localhost:8554/mypath",
+					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
@@ -546,7 +556,8 @@ func TestAPIProtocolList(t *testing.T) {
 					TLSConfig: &tls.Config{InsecureSkipVerify: true},
 				}
 
-				err := source.StartRecording("rtsps://localhost:8322/mypath", media.Medias{medi})
+				err := source.StartRecording("rtsps://localhost:8322/mypath",
+					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
@@ -569,12 +580,11 @@ func TestAPIProtocolList(t *testing.T) {
 				}()
 				require.NoError(t, err)
 				defer nconn.Close()
-				conn := rtmp.NewConn(nconn)
 
-				err = conn.InitializeClient(u, true)
+				conn, err := rtmp.NewClientConn(nconn, u, true)
 				require.NoError(t, err)
 
-				err = conn.WriteTracks(testFormatH264, nil)
+				_, err = rtmp.NewWriter(conn, testFormatH264, nil)
 				require.NoError(t, err)
 
 				time.Sleep(500 * time.Millisecond)
@@ -582,7 +592,7 @@ func TestAPIProtocolList(t *testing.T) {
 			case "hls":
 				source := gortsplib.Client{}
 				err := source.StartRecording("rtsp://localhost:8554/mypath",
-					media.Medias{medi})
+					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
@@ -611,7 +621,7 @@ func TestAPIProtocolList(t *testing.T) {
 							0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc9, 0x20,
 						},*/
 
-						source.WritePacketRTP(medi, &rtp.Packet{
+						err = source.WritePacketRTP(medi, &rtp.Packet{
 							Header: rtp.Header{
 								Version:        2,
 								Marker:         true,
@@ -625,6 +635,7 @@ func TestAPIProtocolList(t *testing.T) {
 								0x05,
 							},
 						})
+						require.NoError(t, err)
 					}
 				}()
 
@@ -638,7 +649,7 @@ func TestAPIProtocolList(t *testing.T) {
 			case "webrtc":
 				source := gortsplib.Client{}
 				err := source.StartRecording("rtsp://localhost:8554/mypath",
-					media.Medias{medi})
+					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
@@ -647,7 +658,7 @@ func TestAPIProtocolList(t *testing.T) {
 
 				time.Sleep(500 * time.Millisecond)
 
-				source.WritePacketRTP(medi, &rtp.Packet{
+				err = source.WritePacketRTP(medi, &rtp.Packet{
 					Header: rtp.Header{
 						Version:        2,
 						Marker:         true,
@@ -656,14 +667,39 @@ func TestAPIProtocolList(t *testing.T) {
 						Timestamp:      45343,
 						SSRC:           563423,
 					},
-					Payload: []byte{0x01, 0x02, 0x03, 0x04},
+					Payload: []byte{5, 1, 2, 3, 4},
 				})
+				require.NoError(t, err)
 
 				<-c.incomingTrack
+
+			case "srt":
+				conf := srt.DefaultConfig()
+				conf.StreamId = "publish:mypath"
+
+				conn, err := srt.Dial("srt", "localhost:8890", conf)
+				require.NoError(t, err)
+				defer conn.Close()
+
+				track := &mpegts.Track{
+					Codec: &mpegts.CodecH264{},
+				}
+
+				bw := bufio.NewWriter(conn)
+				w := mpegts.NewWriter(bw, []*mpegts.Track{track})
+				require.NoError(t, err)
+
+				err = w.WriteH26x(track, 0, 0, true, [][]byte{{1}})
+				require.NoError(t, err)
+
+				err = bw.Flush()
+				require.NoError(t, err)
+
+				time.Sleep(500 * time.Millisecond)
 			}
 
 			switch ca {
-			case "rtsp conns", "rtsp sessions", "rtsps conns", "rtsps sessions", "rtmp", "rtmps":
+			case "rtsp conns", "rtsp sessions", "rtsps conns", "rtsps sessions", "rtmp", "rtmps", "srt":
 				var pa string
 				switch ca {
 				case "rtsp conns":
@@ -683,6 +719,9 @@ func TestAPIProtocolList(t *testing.T) {
 
 				case "rtmps":
 					pa = "rtmpsconns"
+
+				case "srt":
+					pa = "srtconns"
 				}
 
 				type item struct {
@@ -760,6 +799,7 @@ func TestAPIProtocolGet(t *testing.T) {
 		"rtmps",
 		"hls",
 		"webrtc",
+		"srt",
 	} {
 		t.Run(ca, func(t *testing.T) {
 			conf := "api: yes\n"
@@ -792,7 +832,8 @@ func TestAPIProtocolGet(t *testing.T) {
 			case "rtsp conns", "rtsp sessions":
 				source := gortsplib.Client{}
 
-				err := source.StartRecording("rtsp://localhost:8554/mypath", media.Medias{medi})
+				err := source.StartRecording("rtsp://localhost:8554/mypath",
+					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
@@ -801,7 +842,8 @@ func TestAPIProtocolGet(t *testing.T) {
 					TLSConfig: &tls.Config{InsecureSkipVerify: true},
 				}
 
-				err := source.StartRecording("rtsps://localhost:8322/mypath", media.Medias{medi})
+				err := source.StartRecording("rtsps://localhost:8322/mypath",
+					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
@@ -824,12 +866,11 @@ func TestAPIProtocolGet(t *testing.T) {
 				}()
 				require.NoError(t, err)
 				defer nconn.Close()
-				conn := rtmp.NewConn(nconn)
 
-				err = conn.InitializeClient(u, true)
+				conn, err := rtmp.NewClientConn(nconn, u, true)
 				require.NoError(t, err)
 
-				err = conn.WriteTracks(testFormatH264, nil)
+				_, err = rtmp.NewWriter(conn, testFormatH264, nil)
 				require.NoError(t, err)
 
 				time.Sleep(500 * time.Millisecond)
@@ -837,7 +878,7 @@ func TestAPIProtocolGet(t *testing.T) {
 			case "hls":
 				source := gortsplib.Client{}
 				err := source.StartRecording("rtsp://localhost:8554/mypath",
-					media.Medias{medi})
+					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
@@ -866,7 +907,7 @@ func TestAPIProtocolGet(t *testing.T) {
 							0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x60, 0xc9, 0x20,
 						},*/
 
-						source.WritePacketRTP(medi, &rtp.Packet{
+						err := source.WritePacketRTP(medi, &rtp.Packet{
 							Header: rtp.Header{
 								Version:        2,
 								Marker:         true,
@@ -880,6 +921,7 @@ func TestAPIProtocolGet(t *testing.T) {
 								0x05,
 							},
 						})
+						require.NoError(t, err)
 					}
 				}()
 
@@ -893,7 +935,7 @@ func TestAPIProtocolGet(t *testing.T) {
 			case "webrtc":
 				source := gortsplib.Client{}
 				err := source.StartRecording("rtsp://localhost:8554/mypath",
-					media.Medias{medi})
+					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
@@ -902,7 +944,7 @@ func TestAPIProtocolGet(t *testing.T) {
 
 				time.Sleep(500 * time.Millisecond)
 
-				source.WritePacketRTP(medi, &rtp.Packet{
+				err = source.WritePacketRTP(medi, &rtp.Packet{
 					Header: rtp.Header{
 						Version:        2,
 						Marker:         true,
@@ -911,14 +953,39 @@ func TestAPIProtocolGet(t *testing.T) {
 						Timestamp:      45343,
 						SSRC:           563423,
 					},
-					Payload: []byte{0x01, 0x02, 0x03, 0x04},
+					Payload: []byte{5, 1, 2, 3, 4},
 				})
+				require.NoError(t, err)
 
 				<-c.incomingTrack
+
+			case "srt":
+				conf := srt.DefaultConfig()
+				conf.StreamId = "publish:mypath"
+
+				conn, err := srt.Dial("srt", "localhost:8890", conf)
+				require.NoError(t, err)
+				defer conn.Close()
+
+				track := &mpegts.Track{
+					Codec: &mpegts.CodecH264{},
+				}
+
+				bw := bufio.NewWriter(conn)
+				w := mpegts.NewWriter(bw, []*mpegts.Track{track})
+				require.NoError(t, err)
+
+				err = w.WriteH26x(track, 0, 0, true, [][]byte{{1}})
+				require.NoError(t, err)
+
+				err = bw.Flush()
+				require.NoError(t, err)
+
+				time.Sleep(500 * time.Millisecond)
 			}
 
 			switch ca {
-			case "rtsp conns", "rtsp sessions", "rtsps conns", "rtsps sessions", "rtmp", "rtmps":
+			case "rtsp conns", "rtsp sessions", "rtsps conns", "rtsps sessions", "rtmp", "rtmps", "srt":
 				var pa string
 				switch ca {
 				case "rtsp conns":
@@ -938,6 +1005,9 @@ func TestAPIProtocolGet(t *testing.T) {
 
 				case "rtmps":
 					pa = "rtmpsconns"
+
+				case "srt":
+					pa = "srtconns"
 				}
 
 				type item struct {
@@ -1018,6 +1088,7 @@ func TestAPIProtocolGetNotFound(t *testing.T) {
 		"rtmps",
 		"hls",
 		"webrtc",
+		"srt",
 	} {
 		t.Run(ca, func(t *testing.T) {
 			conf := "api: yes\n"
@@ -1069,6 +1140,9 @@ func TestAPIProtocolGetNotFound(t *testing.T) {
 
 			case "webrtc":
 				pa = "webrtcsessions"
+
+			case "srt":
+				pa = "srtconns"
 			}
 
 			func() {
@@ -1098,6 +1172,7 @@ func TestAPIProtocolKick(t *testing.T) {
 		"rtsps",
 		"rtmp",
 		"webrtc",
+		"srt",
 	} {
 		t.Run(ca, func(t *testing.T) {
 			conf := "api: yes\n"
@@ -1125,7 +1200,7 @@ func TestAPIProtocolKick(t *testing.T) {
 				source := gortsplib.Client{}
 
 				err := source.StartRecording("rtsp://localhost:8554/mypath",
-					media.Medias{medi})
+					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
@@ -1135,7 +1210,7 @@ func TestAPIProtocolKick(t *testing.T) {
 				}
 
 				err := source.StartRecording("rtsps://localhost:8322/mypath",
-					media.Medias{medi})
+					&description.Session{Medias: []*description.Media{medi}})
 				require.NoError(t, err)
 				defer source.Close()
 
@@ -1146,17 +1221,38 @@ func TestAPIProtocolKick(t *testing.T) {
 				nconn, err := net.Dial("tcp", u.Host)
 				require.NoError(t, err)
 				defer nconn.Close()
-				conn := rtmp.NewConn(nconn)
 
-				err = conn.InitializeClient(u, true)
+				conn, err := rtmp.NewClientConn(nconn, u, true)
 				require.NoError(t, err)
 
-				err = conn.WriteTracks(testFormatH264, nil)
+				_, err = rtmp.NewWriter(conn, testFormatH264, nil)
 				require.NoError(t, err)
 
 			case "webrtc":
 				c := newWebRTCTestClient(t, hc, "http://localhost:8889/mypath/whip", true)
 				defer c.close()
+
+			case "srt":
+				conf := srt.DefaultConfig()
+				conf.StreamId = "publish:mypath"
+
+				conn, err := srt.Dial("srt", "localhost:8890", conf)
+				require.NoError(t, err)
+				defer conn.Close()
+
+				track := &mpegts.Track{
+					Codec: &mpegts.CodecH264{},
+				}
+
+				bw := bufio.NewWriter(conn)
+				w := mpegts.NewWriter(bw, []*mpegts.Track{track})
+				require.NoError(t, err)
+
+				err = w.WriteH26x(track, 0, 0, true, [][]byte{{1}})
+				require.NoError(t, err)
+
+				err = bw.Flush()
+				require.NoError(t, err)
 			}
 
 			var pa string
@@ -1172,6 +1268,9 @@ func TestAPIProtocolKick(t *testing.T) {
 
 			case "webrtc":
 				pa = "webrtcsessions"
+
+			case "srt":
+				pa = "srtconns"
 			}
 
 			var out1 struct {
@@ -1208,6 +1307,7 @@ func TestAPIProtocolKickNotFound(t *testing.T) {
 		"rtsps",
 		"rtmp",
 		"webrtc",
+		"srt",
 	} {
 		t.Run(ca, func(t *testing.T) {
 			conf := "api: yes\n"
@@ -1241,6 +1341,9 @@ func TestAPIProtocolKickNotFound(t *testing.T) {
 
 			case "webrtc":
 				pa = "webrtcsessions"
+
+			case "srt":
+				pa = "srtconns"
 			}
 
 			func() {

@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"time"
 
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats/rtph265"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph265"
 	"github.com/bluenviron/mediacommon/pkg/codecs/h265"
 	"github.com/pion/rtp"
 
-	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
 // extract VPS, SPS and PPS without decoding RTP packets
@@ -76,49 +76,26 @@ func rtpH265ExtractVPSSPSPPS(pkt *rtp.Packet) ([]byte, []byte, []byte) {
 	}
 }
 
-// UnitH265 is a H265 data unit.
-type UnitH265 struct {
-	RTPPackets []*rtp.Packet
-	NTP        time.Time
-	PTS        time.Duration
-	AU         [][]byte
-}
-
-// GetRTPPackets implements Unit.
-func (d *UnitH265) GetRTPPackets() []*rtp.Packet {
-	return d.RTPPackets
-}
-
-// GetNTP implements Unit.
-func (d *UnitH265) GetNTP() time.Time {
-	return d.NTP
-}
-
 type formatProcessorH265 struct {
 	udpMaxPayloadSize int
-	format            *formats.H265
-	log               logger.Writer
+	format            *format.H265
 
-	encoder                  *rtph265.Encoder
-	decoder                  *rtph265.Decoder
-	lastKeyFrameTimeReceived bool
-	lastKeyFrameTime         time.Time
+	encoder *rtph265.Encoder
+	decoder *rtph265.Decoder
 }
 
 func newH265(
 	udpMaxPayloadSize int,
-	forma *formats.H265,
+	forma *format.H265,
 	generateRTPPackets bool,
-	log logger.Writer,
 ) (*formatProcessorH265, error) {
 	t := &formatProcessorH265{
 		udpMaxPayloadSize: udpMaxPayloadSize,
 		format:            forma,
-		log:               log,
 	}
 
 	if generateRTPPackets {
-		err := t.createEncoder(nil, nil, nil)
+		err := t.createEncoder(nil, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -128,14 +105,14 @@ func newH265(
 }
 
 func (t *formatProcessorH265) createEncoder(
-	ssrc *uint32, initialSequenceNumber *uint16, initialTimestamp *uint32,
+	ssrc *uint32,
+	initialSequenceNumber *uint16,
 ) error {
 	t.encoder = &rtph265.Encoder{
 		PayloadMaxSize:        t.udpMaxPayloadSize - 12,
 		PayloadType:           t.format.PayloadTyp,
 		SSRC:                  ssrc,
 		InitialSequenceNumber: initialSequenceNumber,
-		InitialTimestamp:      initialTimestamp,
 		MaxDONDiff:            t.format.MaxDONDiff,
 	}
 	return t.encoder.Init()
@@ -171,13 +148,13 @@ func (t *formatProcessorH265) updateTrackParametersFromRTPPacket(pkt *rtp.Packet
 	}
 }
 
-func (t *formatProcessorH265) updateTrackParametersFromNALUs(nalus [][]byte) {
+func (t *formatProcessorH265) updateTrackParametersFromAU(au [][]byte) {
 	vps := t.format.VPS
 	sps := t.format.SPS
 	pps := t.format.PPS
 	update := false
 
-	for _, nalu := range nalus {
+	for _, nalu := range au {
 		typ := h265.NALUType((nalu[0] >> 1) & 0b111111)
 
 		switch typ {
@@ -206,24 +183,11 @@ func (t *formatProcessorH265) updateTrackParametersFromNALUs(nalus [][]byte) {
 	}
 }
 
-func (t *formatProcessorH265) checkKeyFrameInterval(ntp time.Time, isKeyFrame bool) {
-	if !t.lastKeyFrameTimeReceived || isKeyFrame {
-		t.lastKeyFrameTimeReceived = true
-		t.lastKeyFrameTime = ntp
-		return
-	}
-
-	if ntp.Sub(t.lastKeyFrameTime) >= maxKeyFrameInterval {
-		t.lastKeyFrameTime = ntp
-		t.log.Log(logger.Warn, "no H265 key frames received in %v, stream can't be decoded", maxKeyFrameInterval)
-	}
-}
-
-func (t *formatProcessorH265) remuxAccessUnit(ntp time.Time, nalus [][]byte) [][]byte {
+func (t *formatProcessorH265) remuxAccessUnit(au [][]byte) [][]byte {
 	isKeyFrame := false
 	n := 0
 
-	for _, nalu := range nalus {
+	for _, nalu := range au {
 		typ := h265.NALUType((nalu[0] >> 1) & 0b111111)
 
 		switch typ {
@@ -246,8 +210,6 @@ func (t *formatProcessorH265) remuxAccessUnit(ntp time.Time, nalus [][]byte) [][
 		n++
 	}
 
-	t.checkKeyFrameInterval(ntp, isKeyFrame)
-
 	if n == 0 {
 		return nil
 	}
@@ -262,7 +224,7 @@ func (t *formatProcessorH265) remuxAccessUnit(ntp time.Time, nalus [][]byte) [][
 		i = 3
 	}
 
-	for _, nalu := range nalus {
+	for _, nalu := range au {
 		typ := h265.NALUType((nalu[0] >> 1) & 0b111111)
 
 		switch typ {
@@ -280,8 +242,8 @@ func (t *formatProcessorH265) remuxAccessUnit(ntp time.Time, nalus [][]byte) [][
 	return filteredNALUs
 }
 
-func (t *formatProcessorH265) Process(unit Unit, hasNonRTSPReaders bool) error { //nolint:dupl
-	tunit := unit.(*UnitH265)
+func (t *formatProcessorH265) Process(u unit.Unit, hasNonRTSPReaders bool) error { //nolint:dupl
+	tunit := u.(*unit.H265)
 
 	if tunit.RTPPackets != nil {
 		pkt := tunit.RTPPackets[0]
@@ -296,8 +258,7 @@ func (t *formatProcessorH265) Process(unit Unit, hasNonRTSPReaders bool) error {
 			if pkt.MarshalSize() > t.udpMaxPayloadSize {
 				v1 := pkt.SSRC
 				v2 := pkt.SequenceNumber
-				v3 := pkt.Timestamp
-				err := t.createEncoder(&v1, &v2, &v3)
+				err := t.createEncoder(&v1, &v2)
 				if err != nil {
 					return err
 				}
@@ -308,27 +269,24 @@ func (t *formatProcessorH265) Process(unit Unit, hasNonRTSPReaders bool) error {
 		if hasNonRTSPReaders || t.decoder != nil || t.encoder != nil {
 			if t.decoder == nil {
 				var err error
-				t.decoder, err = t.format.CreateDecoder2()
+				t.decoder, err = t.format.CreateDecoder()
 				if err != nil {
 					return err
 				}
 			}
 
-			if t.encoder != nil {
-				tunit.RTPPackets = nil
-			}
-
-			// DecodeUntilMarker() is necessary, otherwise Encode() generates partial groups
-			au, pts, err := t.decoder.DecodeUntilMarker(pkt)
+			au, err := t.decoder.Decode(pkt)
 			if err != nil {
 				if err == rtph265.ErrNonStartingPacketAndNoPrevious || err == rtph265.ErrMorePacketsNeeded {
+					if t.encoder != nil {
+						tunit.RTPPackets = nil
+					}
 					return nil
 				}
 				return err
 			}
 
-			tunit.AU = t.remuxAccessUnit(tunit.NTP, au)
-			tunit.PTS = pts
+			tunit.AU = t.remuxAccessUnit(au)
 		}
 
 		// route packet as is
@@ -336,16 +294,17 @@ func (t *formatProcessorH265) Process(unit Unit, hasNonRTSPReaders bool) error {
 			return nil
 		}
 	} else {
-		t.updateTrackParametersFromNALUs(tunit.AU)
-		tunit.AU = t.remuxAccessUnit(tunit.NTP, tunit.AU)
+		t.updateTrackParametersFromAU(tunit.AU)
+		tunit.AU = t.remuxAccessUnit(tunit.AU)
 	}
 
 	// encode into RTP
 	if len(tunit.AU) != 0 {
-		pkts, err := t.encoder.Encode(tunit.AU, tunit.PTS)
+		pkts, err := t.encoder.Encode(tunit.AU)
 		if err != nil {
 			return err
 		}
+		setTimestamp(pkts, tunit.RTPPackets, t.format.ClockRate(), tunit.PTS)
 		tunit.RTPPackets = pkts
 	} else {
 		tunit.RTPPackets = nil
@@ -354,9 +313,12 @@ func (t *formatProcessorH265) Process(unit Unit, hasNonRTSPReaders bool) error {
 	return nil
 }
 
-func (t *formatProcessorH265) UnitForRTPPacket(pkt *rtp.Packet, ntp time.Time) Unit {
-	return &UnitH265{
-		RTPPackets: []*rtp.Packet{pkt},
-		NTP:        ntp,
+func (t *formatProcessorH265) UnitForRTPPacket(pkt *rtp.Packet, ntp time.Time, pts time.Duration) Unit {
+	return &unit.H265{
+		Base: unit.Base{
+			RTPPackets: []*rtp.Packet{pkt},
+			NTP:        ntp,
+			PTS:        pts,
+		},
 	}
 }

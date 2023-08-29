@@ -13,15 +13,14 @@ import (
 
 	"github.com/bluenviron/gohlslib"
 	"github.com/bluenviron/gohlslib/pkg/codecs"
-	"github.com/bluenviron/gortsplib/v3/pkg/formats"
-	"github.com/bluenviron/gortsplib/v3/pkg/media"
-	"github.com/bluenviron/gortsplib/v3/pkg/ringbuffer"
-	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/gin-gonic/gin"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
-	"github.com/bluenviron/mediamtx/internal/formatprocessor"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/stream"
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
 const (
@@ -54,7 +53,7 @@ type hlsMuxerHandleRequestReq struct {
 
 type hlsMuxerParent interface {
 	logger.Writer
-	muxerClose(*hlsMuxer)
+	closeMuxer(*hlsMuxer)
 }
 
 type hlsMuxer struct {
@@ -66,7 +65,7 @@ type hlsMuxer struct {
 	partDuration              conf.StringDuration
 	segmentMaxSize            conf.StringSize
 	directory                 string
-	readBufferCount           int
+	writeQueueSize            int
 	wg                        *sync.WaitGroup
 	pathName                  string
 	pathManager               *pathManager
@@ -76,7 +75,7 @@ type hlsMuxer struct {
 	ctxCancel       func()
 	created         time.Time
 	path            *path
-	ringBuffer      *ringbuffer.RingBuffer
+	writer          *asyncWriter
 	lastRequestTime *int64
 	muxer           *gohlslib.Muxer
 	requests        []*hlsMuxerHandleRequestReq
@@ -96,7 +95,7 @@ func newHLSMuxer(
 	partDuration conf.StringDuration,
 	segmentMaxSize conf.StringSize,
 	directory string,
-	readBufferCount int,
+	writeQueueSize int,
 	wg *sync.WaitGroup,
 	pathName string,
 	pathManager *pathManager,
@@ -113,7 +112,7 @@ func newHLSMuxer(
 		partDuration:              partDuration,
 		segmentMaxSize:            segmentMaxSize,
 		directory:                 directory,
-		readBufferCount:           readBufferCount,
+		writeQueueSize:            writeQueueSize,
 		wg:                        wg,
 		pathName:                  pathName,
 		pathManager:               pathManager,
@@ -228,7 +227,7 @@ func (m *hlsMuxer) run() {
 
 	m.clearQueuedRequests()
 
-	m.parent.muxerClose(m)
+	m.parent.closeMuxer(m)
 
 	m.Log(logger.Info, "destroyed (%v)", err)
 }
@@ -241,7 +240,7 @@ func (m *hlsMuxer) clearQueuedRequests() {
 }
 
 func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) error {
-	res := m.pathManager.readerAdd(pathReaderAddReq{
+	res := m.pathManager.addReader(pathAddReaderReq{
 		author:   m,
 		pathName: m.pathName,
 		skipAuth: true,
@@ -252,11 +251,11 @@ func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) 
 
 	m.path = res.path
 
-	defer m.path.readerRemove(pathReaderRemoveReq{author: m})
+	defer m.path.removeReader(pathRemoveReaderReq{author: m})
 
-	m.ringBuffer, _ = ringbuffer.New(uint64(m.readBufferCount))
+	m.writer = newAsyncWriter(m.writeQueueSize, m)
 
-	var medias media.Medias
+	var medias []*description.Media
 
 	videoMedia, videoTrack := m.createVideoTrack(res.stream)
 	if videoMedia != nil {
@@ -268,11 +267,11 @@ func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) 
 		medias = append(medias, audioMedia)
 	}
 
-	defer res.stream.readerRemove(m)
+	defer res.stream.RemoveReader(m)
 
 	if medias == nil {
 		return fmt.Errorf(
-			"the stream doesn't contain any supported codec, which are currently H264, H265, MPEG4-Audio, Opus")
+			"the stream doesn't contain any supported codec, which are currently H265, H264, Opus, MPEG-4 Audio")
 	}
 
 	var muxerDirectory string
@@ -304,10 +303,7 @@ func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) 
 	m.Log(logger.Info, "is converting into HLS, %s",
 		sourceMediaInfo(medias))
 
-	writerDone := make(chan error)
-	go func() {
-		writerDone <- m.runWriter()
-	}()
+	m.writer.start()
 
 	closeCheckTicker := time.NewTicker(closeCheckPeriod)
 	defer closeCheckTicker.Stop()
@@ -318,45 +314,89 @@ func (m *hlsMuxer) runInner(innerCtx context.Context, innerReady chan struct{}) 
 			if m.remoteAddr != "" {
 				t := time.Unix(0, atomic.LoadInt64(m.lastRequestTime))
 				if time.Since(t) >= closeAfterInactivity {
-					m.ringBuffer.Close()
-					<-writerDone
+					m.writer.stop()
 					return fmt.Errorf("not used anymore")
 				}
 			}
 
-		case err := <-writerDone:
+		case err := <-m.writer.error():
 			return err
 
 		case <-innerCtx.Done():
-			m.ringBuffer.Close()
-			<-writerDone
+			m.writer.stop()
 			return fmt.Errorf("terminated")
 		}
 	}
 }
 
-func (m *hlsMuxer) createVideoTrack(stream *stream) (*media.Media, *gohlslib.Track) {
-	var videoFormatH265 *formats.H265
-	videoMedia := stream.medias().FindFormat(&videoFormatH265)
+func (m *hlsMuxer) createVideoTrack(stream *stream.Stream) (*description.Media, *gohlslib.Track) {
+	var videoFormatAV1 *format.AV1
+	videoMedia := stream.Desc().FindFormat(&videoFormatAV1)
+
+	if videoFormatAV1 != nil {
+		stream.AddReader(m, videoMedia, videoFormatAV1, func(u unit.Unit) {
+			m.writer.push(func() error {
+				tunit := u.(*unit.AV1)
+
+				if tunit.TU == nil {
+					return nil
+				}
+
+				pts := tunit.PTS
+				err := m.muxer.WriteAV1(tunit.NTP, pts, tunit.TU)
+				if err != nil {
+					return fmt.Errorf("muxer error: %v", err)
+				}
+
+				return nil
+			})
+		})
+
+		return videoMedia, &gohlslib.Track{
+			Codec: &codecs.AV1{},
+		}
+	}
+
+	var videoFormatVP9 *format.VP9
+	videoMedia = stream.Desc().FindFormat(&videoFormatVP9)
+
+	if videoFormatVP9 != nil {
+		stream.AddReader(m, videoMedia, videoFormatVP9, func(u unit.Unit) {
+			m.writer.push(func() error {
+				tunit := u.(*unit.VP9)
+
+				if tunit.Frame == nil {
+					return nil
+				}
+
+				pts := tunit.PTS
+				err := m.muxer.WriteVP9(tunit.NTP, pts, tunit.Frame)
+				if err != nil {
+					return fmt.Errorf("muxer error: %v", err)
+				}
+
+				return nil
+			})
+		})
+
+		return videoMedia, &gohlslib.Track{
+			Codec: &codecs.VP9{},
+		}
+	}
+
+	var videoFormatH265 *format.H265
+	videoMedia = stream.Desc().FindFormat(&videoFormatH265)
 
 	if videoFormatH265 != nil {
-		videoStartPTSFilled := false
-		var videoStartPTS time.Duration
-
-		stream.readerAdd(m, videoMedia, videoFormatH265, func(unit formatprocessor.Unit) {
-			m.ringBuffer.Push(func() error {
-				tunit := unit.(*formatprocessor.UnitH265)
+		stream.AddReader(m, videoMedia, videoFormatH265, func(u unit.Unit) {
+			m.writer.push(func() error {
+				tunit := u.(*unit.H265)
 
 				if tunit.AU == nil {
 					return nil
 				}
 
-				if !videoStartPTSFilled {
-					videoStartPTSFilled = true
-					videoStartPTS = tunit.PTS
-				}
-				pts := tunit.PTS - videoStartPTS
-
+				pts := tunit.PTS
 				err := m.muxer.WriteH26x(tunit.NTP, pts, tunit.AU)
 				if err != nil {
 					return fmt.Errorf("muxer error: %v", err)
@@ -377,27 +417,19 @@ func (m *hlsMuxer) createVideoTrack(stream *stream) (*media.Media, *gohlslib.Tra
 		}
 	}
 
-	var videoFormatH264 *formats.H264
-	videoMedia = stream.medias().FindFormat(&videoFormatH264)
+	var videoFormatH264 *format.H264
+	videoMedia = stream.Desc().FindFormat(&videoFormatH264)
 
 	if videoFormatH264 != nil {
-		videoStartPTSFilled := false
-		var videoStartPTS time.Duration
-
-		stream.readerAdd(m, videoMedia, videoFormatH264, func(unit formatprocessor.Unit) {
-			m.ringBuffer.Push(func() error {
-				tunit := unit.(*formatprocessor.UnitH264)
+		stream.AddReader(m, videoMedia, videoFormatH264, func(u unit.Unit) {
+			m.writer.push(func() error {
+				tunit := u.(*unit.H264)
 
 				if tunit.AU == nil {
 					return nil
 				}
 
-				if !videoStartPTSFilled {
-					videoStartPTSFilled = true
-					videoStartPTS = tunit.PTS
-				}
-				pts := tunit.PTS - videoStartPTS
-
+				pts := tunit.PTS
 				err := m.muxer.WriteH26x(tunit.NTP, pts, tunit.AU)
 				if err != nil {
 					return fmt.Errorf("muxer error: %v", err)
@@ -420,37 +452,59 @@ func (m *hlsMuxer) createVideoTrack(stream *stream) (*media.Media, *gohlslib.Tra
 	return nil, nil
 }
 
-func (m *hlsMuxer) createAudioTrack(stream *stream) (*media.Media, *gohlslib.Track) {
-	var audioFormatMPEG4AudioGeneric *formats.MPEG4AudioGeneric
-	audioMedia := stream.medias().FindFormat(&audioFormatMPEG4AudioGeneric)
+func (m *hlsMuxer) createAudioTrack(stream *stream.Stream) (*description.Media, *gohlslib.Track) {
+	var audioFormatOpus *format.Opus
+	audioMedia := stream.Desc().FindFormat(&audioFormatOpus)
 
 	if audioMedia != nil {
-		audioStartPTSFilled := false
-		var audioStartPTS time.Duration
+		stream.AddReader(m, audioMedia, audioFormatOpus, func(u unit.Unit) {
+			m.writer.push(func() error {
+				tunit := u.(*unit.Opus)
 
-		stream.readerAdd(m, audioMedia, audioFormatMPEG4AudioGeneric, func(unit formatprocessor.Unit) {
-			m.ringBuffer.Push(func() error {
-				tunit := unit.(*formatprocessor.UnitMPEG4AudioGeneric)
+				pts := tunit.PTS
+				err := m.muxer.WriteOpus(
+					tunit.NTP,
+					pts,
+					tunit.Packets)
+				if err != nil {
+					return fmt.Errorf("muxer error: %v", err)
+				}
+
+				return nil
+			})
+		})
+
+		return audioMedia, &gohlslib.Track{
+			Codec: &codecs.Opus{
+				ChannelCount: func() int {
+					if audioFormatOpus.IsStereo {
+						return 2
+					}
+					return 1
+				}(),
+			},
+		}
+	}
+
+	var audioFormatMPEG4AudioGeneric *format.MPEG4AudioGeneric
+	audioMedia = stream.Desc().FindFormat(&audioFormatMPEG4AudioGeneric)
+
+	if audioMedia != nil {
+		stream.AddReader(m, audioMedia, audioFormatMPEG4AudioGeneric, func(u unit.Unit) {
+			m.writer.push(func() error {
+				tunit := u.(*unit.MPEG4AudioGeneric)
 
 				if tunit.AUs == nil {
 					return nil
 				}
 
-				if !audioStartPTSFilled {
-					audioStartPTSFilled = true
-					audioStartPTS = tunit.PTS
-				}
-				pts := tunit.PTS - audioStartPTS
-
-				for i, au := range tunit.AUs {
-					err := m.muxer.WriteAudio(
-						tunit.NTP,
-						pts+time.Duration(i)*mpeg4audio.SamplesPerAccessUnit*
-							time.Second/time.Duration(audioFormatMPEG4AudioGeneric.ClockRate()),
-						au)
-					if err != nil {
-						return fmt.Errorf("muxer error: %v", err)
-					}
+				pts := tunit.PTS
+				err := m.muxer.WriteMPEG4Audio(
+					tunit.NTP,
+					pts,
+					tunit.AUs)
+				if err != nil {
+					return fmt.Errorf("muxer error: %v", err)
 				}
 
 				return nil
@@ -464,34 +518,26 @@ func (m *hlsMuxer) createAudioTrack(stream *stream) (*media.Media, *gohlslib.Tra
 		}
 	}
 
-	var audioFormatMPEG4AudioLATM *formats.MPEG4AudioLATM
-	audioMedia = stream.medias().FindFormat(&audioFormatMPEG4AudioLATM)
+	var audioFormatMPEG4AudioLATM *format.MPEG4AudioLATM
+	audioMedia = stream.Desc().FindFormat(&audioFormatMPEG4AudioLATM)
 
 	if audioMedia != nil &&
 		audioFormatMPEG4AudioLATM.Config != nil &&
 		len(audioFormatMPEG4AudioLATM.Config.Programs) == 1 &&
 		len(audioFormatMPEG4AudioLATM.Config.Programs[0].Layers) == 1 {
-		audioStartPTSFilled := false
-		var audioStartPTS time.Duration
-
-		stream.readerAdd(m, audioMedia, audioFormatMPEG4AudioLATM, func(unit formatprocessor.Unit) {
-			m.ringBuffer.Push(func() error {
-				tunit := unit.(*formatprocessor.UnitMPEG4AudioLATM)
+		stream.AddReader(m, audioMedia, audioFormatMPEG4AudioLATM, func(u unit.Unit) {
+			m.writer.push(func() error {
+				tunit := u.(*unit.MPEG4AudioLATM)
 
 				if tunit.AU == nil {
 					return nil
 				}
 
-				if !audioStartPTSFilled {
-					audioStartPTSFilled = true
-					audioStartPTS = tunit.PTS
-				}
-				pts := tunit.PTS - audioStartPTS
-
-				err := m.muxer.WriteAudio(
+				pts := tunit.PTS
+				err := m.muxer.WriteMPEG4Audio(
 					tunit.NTP,
 					pts,
-					tunit.AU)
+					[][]byte{tunit.AU})
 				if err != nil {
 					return fmt.Errorf("muxer error: %v", err)
 				}
@@ -507,62 +553,7 @@ func (m *hlsMuxer) createAudioTrack(stream *stream) (*media.Media, *gohlslib.Tra
 		}
 	}
 
-	var audioFormatOpus *formats.Opus
-	audioMedia = stream.medias().FindFormat(&audioFormatOpus)
-
-	if audioMedia != nil {
-		audioStartPTSFilled := false
-		var audioStartPTS time.Duration
-
-		stream.readerAdd(m, audioMedia, audioFormatOpus, func(unit formatprocessor.Unit) {
-			m.ringBuffer.Push(func() error {
-				tunit := unit.(*formatprocessor.UnitOpus)
-
-				if !audioStartPTSFilled {
-					audioStartPTSFilled = true
-					audioStartPTS = tunit.PTS
-				}
-				pts := tunit.PTS - audioStartPTS
-
-				err := m.muxer.WriteAudio(
-					tunit.NTP,
-					pts,
-					tunit.Frame)
-				if err != nil {
-					return fmt.Errorf("muxer error: %v", err)
-				}
-
-				return nil
-			})
-		})
-
-		return audioMedia, &gohlslib.Track{
-			Codec: &codecs.Opus{
-				Channels: func() int {
-					if audioFormatOpus.IsStereo {
-						return 2
-					}
-					return 1
-				}(),
-			},
-		}
-	}
-
 	return nil, nil
-}
-
-func (m *hlsMuxer) runWriter() error {
-	for {
-		item, ok := m.ringBuffer.Pull()
-		if !ok {
-			return fmt.Errorf("terminated")
-		}
-
-		err := item.(func() error)()
-		if err != nil {
-			return err
-		}
-	}
 }
 
 func (m *hlsMuxer) handleRequest(ctx *gin.Context) {

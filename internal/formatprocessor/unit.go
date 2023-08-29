@@ -13,4 +13,7 @@ type Unit interface {
 
 	// returns the NTP timestamp of the unit.
 	GetNTP() time.Time
+
+	// returns the PTS of the unit.
+	GetPTS() time.Duration
 }
