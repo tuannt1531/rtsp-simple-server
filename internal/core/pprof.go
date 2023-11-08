@@ -8,8 +8,9 @@ import (
 	_ "net/http/pprof"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
-	"github.com/bluenviron/mediamtx/internal/httpserv"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/protocols/httpserv"
+	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
 )
 
 type pprofParent interface {
@@ -31,7 +32,7 @@ func newPPROF(
 		parent: parent,
 	}
 
-	network, address := restrictNetwork("tcp", address)
+	network, address := restrictnetwork.Restrict("tcp", address)
 
 	var err error
 	pp.httpServer, err = httpserv.NewWrappedServer(

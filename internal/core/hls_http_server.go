@@ -12,8 +12,9 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
-	"github.com/bluenviron/mediamtx/internal/httpserv"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/protocols/httpserv"
+	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
 )
 
 const (
@@ -70,7 +71,7 @@ func newHLSHTTPServer( //nolint:dupl
 
 	router.NoRoute(s.onRequest)
 
-	network, address := restrictNetwork("tcp", address)
+	network, address := restrictnetwork.Restrict("tcp", address)
 
 	var err error
 	s.inner, err = httpserv.NewWrappedServer(
@@ -128,7 +129,7 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 		ctx.Writer.Write(hlsMinJS)
 		return
 
-	case pa == "", pa == "favicon.ico":
+	case pa == "", pa == "favicon.ico", strings.HasSuffix(pa, "/hls.min.js.map"):
 		return
 
 	case strings.HasSuffix(pa, ".m3u8") ||
@@ -163,14 +164,14 @@ func (s *hlsHTTPServer) onRequest(ctx *gin.Context) {
 	user, pass, hasCredentials := ctx.Request.BasicAuth()
 
 	res := s.pathManager.getConfForPath(pathGetConfForPathReq{
-		name:    dir,
-		publish: false,
-		credentials: authCredentials{
-			query: ctx.Request.URL.RawQuery,
-			ip:    net.ParseIP(ctx.ClientIP()),
-			user:  user,
-			pass:  pass,
-			proto: authProtocolHLS,
+		accessRequest: pathAccessRequest{
+			name:    dir,
+			query:   ctx.Request.URL.RawQuery,
+			publish: false,
+			ip:      net.ParseIP(ctx.ClientIP()),
+			user:    user,
+			pass:    pass,
+			proto:   authProtocolHLS,
 		},
 	})
 	if res.err != nil {

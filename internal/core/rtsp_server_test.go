@@ -1,9 +1,7 @@
 package core
 
 import (
-	"os"
 	"testing"
-	"time"
 
 	"github.com/bluenviron/gortsplib/v4"
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
@@ -11,34 +9,6 @@ import (
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
-
-func TestRTSPServerRunOnConnect(t *testing.T) {
-	f, err := os.CreateTemp(os.TempDir(), "rtspss-runonconnect-")
-	require.NoError(t, err)
-	f.Close()
-	defer os.Remove(f.Name())
-
-	p, ok := newInstance(
-		"runOnConnect: sh -c 'echo aa > " + f.Name() + "'\n" +
-			"paths:\n" +
-			"  all:\n")
-	require.Equal(t, true, ok)
-	defer p.Close()
-
-	source := gortsplib.Client{}
-
-	err = source.StartRecording(
-		"rtsp://127.0.0.1:8554/mypath",
-		&description.Session{Medias: []*description.Media{testMediaH264}})
-	require.NoError(t, err)
-	defer source.Close()
-
-	time.Sleep(500 * time.Millisecond)
-
-	byts, err := os.ReadFile(f.Name())
-	require.NoError(t, err)
-	require.Equal(t, "aa\n", string(byts))
-}
 
 func TestRTSPServer(t *testing.T) {
 	for _, auth := range []string{
@@ -52,14 +22,14 @@ func TestRTSPServer(t *testing.T) {
 			switch auth {
 			case "none":
 				conf = "paths:\n" +
-					"  all:\n"
+					"  all_others:\n"
 
 			case "internal":
 				conf = "rtmp: no\n" +
 					"hls: no\n" +
 					"webrtc: no\n" +
 					"paths:\n" +
-					"  all:\n" +
+					"  all_others:\n" +
 					"    publishUser: testpublisher\n" +
 					"    publishPass: testpass\n" +
 					"    publishIPs: [127.0.0.0/16]\n" +
@@ -70,7 +40,7 @@ func TestRTSPServer(t *testing.T) {
 			case "external":
 				conf = "externalAuthenticationURL: http://localhost:9120/auth\n" +
 					"paths:\n" +
-					"  all:\n"
+					"  all_others:\n"
 			}
 
 			p, ok := newInstance(conf)
@@ -125,7 +95,7 @@ func TestRTSPServerAuthHashed(t *testing.T) {
 			"hls: no\n" +
 			"webrtc: no\n" +
 			"paths:\n" +
-			"  all:\n" +
+			"  all_others:\n" +
 			"    publishUser: sha256:rl3rgi4NcZkpAEcacZnQ2VuOfJ0FxAqCRaKB/SwdZoQ=\n" +
 			"    publishPass: sha256:E9JJ8stBJ7QM+nV4ZoUCeHk/gU3tPFh/5YieiJp6n2w=\n")
 	require.Equal(t, true, ok)
@@ -169,7 +139,7 @@ func TestRTSPServerAuthFail(t *testing.T) {
 				"hls: no\n" +
 				"webrtc: no\n" +
 				"paths:\n" +
-				"  all:\n" +
+				"  all_others:\n" +
 				"    publishUser: testuser\n" +
 				"    publishPass: testpass\n")
 			require.Equal(t, true, ok)
@@ -213,7 +183,7 @@ func TestRTSPServerAuthFail(t *testing.T) {
 				"hls: no\n" +
 				"webrtc: no\n" +
 				"paths:\n" +
-				"  all:\n" +
+				"  all_others:\n" +
 				"    readUser: testuser\n" +
 				"    readPass: testpass\n")
 			require.Equal(t, true, ok)
@@ -238,7 +208,7 @@ func TestRTSPServerAuthFail(t *testing.T) {
 			"hls: no\n" +
 			"webrtc: no\n" +
 			"paths:\n" +
-			"  all:\n" +
+			"  all_others:\n" +
 			"    publishIPs: [128.0.0.1/32]\n")
 		require.Equal(t, true, ok)
 		defer p.Close()
@@ -257,7 +227,7 @@ func TestRTSPServerAuthFail(t *testing.T) {
 	t.Run("external", func(t *testing.T) {
 		p, ok := newInstance("externalAuthenticationURL: http://localhost:9120/auth\n" +
 			"paths:\n" +
-			"  all:\n")
+			"  all_others:\n")
 		require.Equal(t, true, ok)
 		defer p.Close()
 
@@ -284,7 +254,7 @@ func TestRTSPServerPublisherOverride(t *testing.T) {
 		t.Run(ca, func(t *testing.T) {
 			conf := "rtmp: no\n" +
 				"paths:\n" +
-				"  all:\n"
+				"  all_others:\n"
 
 			if ca == "disabled" {
 				conf += "    overridePublisher: no\n"

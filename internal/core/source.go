@@ -6,17 +6,18 @@ import (
 
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
 
+	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
 // source is an entity that can provide a stream.
 // it can be:
-// - a publisher
-// - sourceStatic
-// - sourceRedirect
+// - publisher
+// - staticSourceHandler
+// - redirectSource
 type source interface {
 	logger.Writer
-	apiSourceDescribe() pathAPISourceOrReader
+	APISourceDescribe() defs.APIPathSourceOrReader
 }
 
 func mediaDescription(media *description.Media) string {
@@ -35,7 +36,7 @@ func mediasDescription(medias []*description.Media) []string {
 	return ret
 }
 
-func sourceMediaInfo(medias []*description.Media) string {
+func mediaInfo(medias []*description.Media) string {
 	return fmt.Sprintf("%d %s (%s)",
 		len(medias),
 		func() string {

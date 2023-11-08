@@ -10,8 +10,9 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
-	"github.com/bluenviron/mediamtx/internal/httpserv"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/protocols/httpserv"
+	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
 )
 
 func metric(key string, tags string, value int64) string {
@@ -31,6 +32,7 @@ type metrics struct {
 	rtspServer    apiRTSPServer
 	rtspsServer   apiRTSPServer
 	rtmpServer    apiRTMPServer
+	srtServer     apiSRTServer
 	hlsManager    apiHLSManager
 	webRTCManager apiWebRTCManager
 }
@@ -49,7 +51,7 @@ func newMetrics(
 
 	router.GET("/metrics", m.onMetrics)
 
-	network, address := restrictNetwork("tcp", address)
+	network, address := restrictnetwork.Restrict("tcp", address)
 
 	var err error
 	m.httpServer, err = httpserv.NewWrappedServer(
@@ -86,7 +88,7 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 	if err == nil && len(data.Items) != 0 {
 		for _, i := range data.Items {
 			var state string
-			if i.SourceReady {
+			if i.Ready {
 				state = "ready"
 			} else {
 				state = "notReady"
@@ -95,6 +97,7 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 			tags := "{name=\"" + i.Name + "\",state=\"" + state + "\"}"
 			out += metric("paths", tags, 1)
 			out += metric("paths_bytes_received", tags, int64(i.BytesReceived))
+			out += metric("paths_bytes_sent", tags, int64(i.BytesSent))
 		}
 	} else {
 		out += metric("paths", "", 0)
@@ -198,11 +201,27 @@ func (m *metrics) onMetrics(ctx *gin.Context) {
 		}
 	}
 
+	if !interfaceIsEmpty(m.srtServer) {
+		data, err := m.srtServer.apiConnsList()
+		if err == nil && len(data.Items) != 0 {
+			for _, i := range data.Items {
+				tags := "{id=\"" + i.ID.String() + "\",state=\"" + string(i.State) + "\"}"
+				out += metric("srt_conns", tags, 1)
+				out += metric("srt_conns_bytes_received", tags, int64(i.BytesReceived))
+				out += metric("srt_conns_bytes_sent", tags, int64(i.BytesSent))
+			}
+		} else {
+			out += metric("srt_conns", "", 0)
+			out += metric("srt_conns_bytes_received", "", 0)
+			out += metric("srt_conns_bytes_sent", "", 0)
+		}
+	}
+
 	if !interfaceIsEmpty(m.webRTCManager) {
 		data, err := m.webRTCManager.apiSessionsList()
 		if err == nil && len(data.Items) != 0 {
 			for _, i := range data.Items {
-				tags := "{id=\"" + i.ID.String() + "\"}"
+				tags := "{id=\"" + i.ID.String() + "\",state=\"" + string(i.State) + "\"}"
 				out += metric("webrtc_sessions", tags, 1)
 				out += metric("webrtc_sessions_bytes_received", tags, int64(i.BytesReceived))
 				out += metric("webrtc_sessions_bytes_sent", tags, int64(i.BytesSent))
@@ -251,6 +270,13 @@ func (m *metrics) rtmpServerSet(s apiRTMPServer) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.rtmpServer = s
+}
+
+// srtServerSet is called by srtServer.
+func (m *metrics) srtServerSet(s apiSRTServer) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.srtServer = s
 }
 
 // webRTCManagerSet is called by webRTCManager.

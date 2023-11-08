@@ -11,161 +11,255 @@ import (
 	"time"
 
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtpav1"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph264"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtpvp8"
+	"github.com/bluenviron/gortsplib/v4/pkg/format/rtpvp9"
 	"github.com/bluenviron/gortsplib/v4/pkg/rtptime"
 	"github.com/google/uuid"
 	"github.com/pion/sdp/v3"
-	"github.com/pion/webrtc/v3"
+	pwebrtc "github.com/pion/webrtc/v3"
 
+	"github.com/bluenviron/mediamtx/internal/asyncwriter"
+	"github.com/bluenviron/mediamtx/internal/defs"
+	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
-	"github.com/bluenviron/mediamtx/internal/webrtcpc"
+	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
+	"github.com/bluenviron/mediamtx/internal/stream"
+	"github.com/bluenviron/mediamtx/internal/unit"
 )
 
-type trackRecvPair struct {
-	track    *webrtc.TrackRemote
-	receiver *webrtc.RTPReceiver
-}
+type setupStreamFunc func(*webrtc.OutgoingTrack) error
 
-func webrtcMediasOfOutgoingTracks(tracks []*webRTCOutgoingTrack) []*description.Media {
-	ret := make([]*description.Media, len(tracks))
-	for i, track := range tracks {
-		ret[i] = track.media
-	}
-	return ret
-}
+func webrtcFindVideoTrack(
+	stream *stream.Stream,
+	writer *asyncwriter.Writer,
+) (format.Format, setupStreamFunc) {
+	var av1Format *format.AV1
+	media := stream.Desc().FindFormat(&av1Format)
 
-func webrtcMediasOfIncomingTracks(tracks []*webRTCIncomingTrack) []*description.Media {
-	ret := make([]*description.Media, len(tracks))
-	for i, track := range tracks {
-		ret[i] = track.media
-	}
-	return ret
-}
-
-func whipOffer(body []byte) *webrtc.SessionDescription {
-	return &webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer,
-		SDP:  string(body),
-	}
-}
-
-func webrtcWaitUntilConnected(
-	ctx context.Context,
-	pc *webrtcpc.PeerConnection,
-) error {
-	t := time.NewTimer(webrtcHandshakeTimeout)
-	defer t.Stop()
-
-outer:
-	for {
-		select {
-		case <-t.C:
-			return fmt.Errorf("deadline exceeded while waiting connection")
-
-		case <-pc.Connected():
-			break outer
-
-		case <-ctx.Done():
-			return fmt.Errorf("terminated")
-		}
-	}
-
-	return nil
-}
-
-func webrtcGatherOutgoingTracks(desc *description.Session) ([]*webRTCOutgoingTrack, error) {
-	var tracks []*webRTCOutgoingTrack
-
-	videoTrack, err := newWebRTCOutgoingTrackVideo(desc)
-	if err != nil {
-		return nil, err
-	}
-
-	if videoTrack != nil {
-		tracks = append(tracks, videoTrack)
-	}
-
-	audioTrack, err := newWebRTCOutgoingTrackAudio(desc)
-	if err != nil {
-		return nil, err
-	}
-
-	if audioTrack != nil {
-		tracks = append(tracks, audioTrack)
-	}
-
-	if tracks == nil {
-		return nil, fmt.Errorf(
-			"the stream doesn't contain any supported codec, which are currently AV1, VP9, VP8, H264, Opus, G722, G711")
-	}
-
-	return tracks, nil
-}
-
-func webrtcTrackCount(medias []*sdp.MediaDescription) (int, error) {
-	videoTrack := false
-	audioTrack := false
-	trackCount := 0
-
-	for _, media := range medias {
-		switch media.MediaName.Media {
-		case "video":
-			if videoTrack {
-				return 0, fmt.Errorf("only a single video and a single audio track are supported")
+	if av1Format != nil {
+		return av1Format, func(track *webrtc.OutgoingTrack) error {
+			encoder := &rtpav1.Encoder{
+				PayloadType:    105,
+				PayloadMaxSize: webrtcPayloadMaxSize,
 			}
-			videoTrack = true
-
-		case "audio":
-			if audioTrack {
-				return 0, fmt.Errorf("only a single video and a single audio track are supported")
-			}
-			audioTrack = true
-
-		default:
-			return 0, fmt.Errorf("unsupported media '%s'", media.MediaName.Media)
-		}
-
-		trackCount++
-	}
-
-	return trackCount, nil
-}
-
-func webrtcGatherIncomingTracks(
-	ctx context.Context,
-	pc *webrtcpc.PeerConnection,
-	trackRecv chan trackRecvPair,
-	trackCount int,
-) ([]*webRTCIncomingTrack, error) {
-	var tracks []*webRTCIncomingTrack
-
-	t := time.NewTimer(webrtcTrackGatherTimeout)
-	defer t.Stop()
-
-	for {
-		select {
-		case <-t.C:
-			if trackCount == 0 {
-				return tracks, nil
-			}
-			return nil, fmt.Errorf("deadline exceeded while waiting tracks")
-
-		case pair := <-trackRecv:
-			track, err := newWebRTCIncomingTrack(pair.track, pair.receiver, pc.WriteRTCP)
+			err := encoder.Init()
 			if err != nil {
-				return nil, err
-			}
-			tracks = append(tracks, track)
-
-			if len(tracks) == trackCount {
-				return tracks, nil
+				return err
 			}
 
-		case <-pc.Disconnected():
-			return nil, fmt.Errorf("peer connection closed")
+			stream.AddReader(writer, media, av1Format, func(u unit.Unit) error {
+				tunit := u.(*unit.AV1)
 
-		case <-ctx.Done():
-			return nil, fmt.Errorf("terminated")
+				if tunit.TU == nil {
+					return nil
+				}
+
+				packets, err := encoder.Encode(tunit.TU)
+				if err != nil {
+					return nil //nolint:nilerr
+				}
+
+				for _, pkt := range packets {
+					pkt.Timestamp += tunit.RTPPackets[0].Timestamp
+					track.WriteRTP(pkt) //nolint:errcheck
+				}
+
+				return nil
+			})
+
+			return nil
 		}
+	}
+
+	var vp9Format *format.VP9
+	media = stream.Desc().FindFormat(&vp9Format)
+
+	if vp9Format != nil {
+		return vp9Format, func(track *webrtc.OutgoingTrack) error {
+			encoder := &rtpvp9.Encoder{
+				PayloadType:    96,
+				PayloadMaxSize: webrtcPayloadMaxSize,
+			}
+			err := encoder.Init()
+			if err != nil {
+				return err
+			}
+
+			stream.AddReader(writer, media, vp9Format, func(u unit.Unit) error {
+				tunit := u.(*unit.VP9)
+
+				if tunit.Frame == nil {
+					return nil
+				}
+
+				packets, err := encoder.Encode(tunit.Frame)
+				if err != nil {
+					return nil //nolint:nilerr
+				}
+
+				for _, pkt := range packets {
+					pkt.Timestamp += tunit.RTPPackets[0].Timestamp
+					track.WriteRTP(pkt) //nolint:errcheck
+				}
+
+				return nil
+			})
+
+			return nil
+		}
+	}
+
+	var vp8Format *format.VP8
+	media = stream.Desc().FindFormat(&vp8Format)
+
+	if vp8Format != nil {
+		return vp8Format, func(track *webrtc.OutgoingTrack) error {
+			encoder := &rtpvp8.Encoder{
+				PayloadType:    96,
+				PayloadMaxSize: webrtcPayloadMaxSize,
+			}
+			err := encoder.Init()
+			if err != nil {
+				return err
+			}
+
+			stream.AddReader(writer, media, vp8Format, func(u unit.Unit) error {
+				tunit := u.(*unit.VP8)
+
+				if tunit.Frame == nil {
+					return nil
+				}
+
+				packets, err := encoder.Encode(tunit.Frame)
+				if err != nil {
+					return nil //nolint:nilerr
+				}
+
+				for _, pkt := range packets {
+					pkt.Timestamp += tunit.RTPPackets[0].Timestamp
+					track.WriteRTP(pkt) //nolint:errcheck
+				}
+
+				return nil
+			})
+
+			return nil
+		}
+	}
+
+	var h264Format *format.H264
+	media = stream.Desc().FindFormat(&h264Format)
+
+	if h264Format != nil {
+		return h264Format, func(track *webrtc.OutgoingTrack) error {
+			encoder := &rtph264.Encoder{
+				PayloadType:    96,
+				PayloadMaxSize: webrtcPayloadMaxSize,
+			}
+			err := encoder.Init()
+			if err != nil {
+				return err
+			}
+
+			firstReceived := false
+			var lastPTS time.Duration
+
+			stream.AddReader(writer, media, h264Format, func(u unit.Unit) error {
+				tunit := u.(*unit.H264)
+
+				if tunit.AU == nil {
+					return nil
+				}
+
+				if !firstReceived {
+					firstReceived = true
+				} else if tunit.PTS < lastPTS {
+					return fmt.Errorf("WebRTC doesn't support H264 streams with B-frames")
+				}
+				lastPTS = tunit.PTS
+
+				packets, err := encoder.Encode(tunit.AU)
+				if err != nil {
+					return nil //nolint:nilerr
+				}
+
+				for _, pkt := range packets {
+					pkt.Timestamp += tunit.RTPPackets[0].Timestamp
+					track.WriteRTP(pkt) //nolint:errcheck
+				}
+
+				return nil
+			})
+
+			return nil
+		}
+	}
+
+	return nil, nil
+}
+
+func webrtcFindAudioTrack(
+	stream *stream.Stream,
+	writer *asyncwriter.Writer,
+) (format.Format, setupStreamFunc) {
+	var opusFormat *format.Opus
+	media := stream.Desc().FindFormat(&opusFormat)
+
+	if opusFormat != nil {
+		return opusFormat, func(track *webrtc.OutgoingTrack) error {
+			stream.AddReader(writer, media, opusFormat, func(u unit.Unit) error {
+				for _, pkt := range u.GetRTPPackets() {
+					track.WriteRTP(pkt) //nolint:errcheck
+				}
+
+				return nil
+			})
+			return nil
+		}
+	}
+
+	var g722Format *format.G722
+	media = stream.Desc().FindFormat(&g722Format)
+
+	if g722Format != nil {
+		return g722Format, func(track *webrtc.OutgoingTrack) error {
+			stream.AddReader(writer, media, g722Format, func(u unit.Unit) error {
+				for _, pkt := range u.GetRTPPackets() {
+					track.WriteRTP(pkt) //nolint:errcheck
+				}
+
+				return nil
+			})
+			return nil
+		}
+	}
+
+	var g711Format *format.G711
+	media = stream.Desc().FindFormat(&g711Format)
+
+	if g711Format != nil {
+		return g711Format, func(track *webrtc.OutgoingTrack) error {
+			stream.AddReader(writer, media, g711Format, func(u unit.Unit) error {
+				for _, pkt := range u.GetRTPPackets() {
+					track.WriteRTP(pkt) //nolint:errcheck
+				}
+
+				return nil
+			})
+			return nil
+		}
+	}
+
+	return nil, nil
+}
+
+func whipOffer(body []byte) *pwebrtc.SessionDescription {
+	return &pwebrtc.SessionDescription{
+		Type: pwebrtc.SDPTypeOffer,
+		SDP:  string(body),
 	}
 }
 
@@ -175,12 +269,13 @@ type webRTCSessionPathManager interface {
 }
 
 type webRTCSession struct {
-	writeQueueSize int
-	api            *webrtc.API
-	req            webRTCNewSessionReq
-	wg             *sync.WaitGroup
-	pathManager    webRTCSessionPathManager
-	parent         *webRTCManager
+	writeQueueSize  int
+	api             *pwebrtc.API
+	req             webRTCNewSessionReq
+	wg              *sync.WaitGroup
+	externalCmdPool *externalcmd.Pool
+	pathManager     webRTCSessionPathManager
+	parent          *webRTCManager
 
 	ctx       context.Context
 	ctxCancel func()
@@ -188,7 +283,7 @@ type webRTCSession struct {
 	uuid      uuid.UUID
 	secret    uuid.UUID
 	mutex     sync.RWMutex
-	pc        *webrtcpc.PeerConnection
+	pc        *webrtc.PeerConnection
 
 	chNew           chan webRTCNewSessionReq
 	chAddCandidates chan webRTCAddSessionCandidatesReq
@@ -197,9 +292,10 @@ type webRTCSession struct {
 func newWebRTCSession(
 	parentCtx context.Context,
 	writeQueueSize int,
-	api *webrtc.API,
+	api *pwebrtc.API,
 	req webRTCNewSessionReq,
 	wg *sync.WaitGroup,
+	externalCmdPool *externalcmd.Pool,
 	pathManager webRTCSessionPathManager,
 	parent *webRTCManager,
 ) *webRTCSession {
@@ -210,8 +306,9 @@ func newWebRTCSession(
 		api:             api,
 		req:             req,
 		wg:              wg,
-		parent:          parent,
+		externalCmdPool: externalCmdPool,
 		pathManager:     pathManager,
+		parent:          parent,
 		ctx:             ctx,
 		ctxCancel:       ctxCancel,
 		created:         time.Now(),
@@ -247,7 +344,7 @@ func (s *webRTCSession) run() {
 
 	s.parent.closeSession(s)
 
-	s.Log(logger.Info, "closed (%v)", err)
+	s.Log(logger.Info, "closed: %v", err)
 }
 
 func (s *webRTCSession) runInner() error {
@@ -261,8 +358,8 @@ func (s *webRTCSession) runInner() error {
 
 	if errStatusCode != 0 {
 		s.req.res <- webRTCNewSessionRes{
-			err:           err,
 			errStatusCode: errStatusCode,
+			err:           err,
 		}
 	}
 
@@ -280,15 +377,16 @@ func (s *webRTCSession) runPublish() (int, error) {
 	ip, _, _ := net.SplitHostPort(s.req.remoteAddr)
 
 	res := s.pathManager.addPublisher(pathAddPublisherReq{
-		author:   s,
-		pathName: s.req.pathName,
-		credentials: authCredentials{
-			query: s.req.query,
-			ip:    net.ParseIP(ip),
-			user:  s.req.user,
-			pass:  s.req.pass,
-			proto: authProtocolWebRTC,
-			id:    &s.uuid,
+		author: s,
+		accessRequest: pathAccessRequest{
+			name:    s.req.pathName,
+			query:   s.req.query,
+			publish: true,
+			ip:      net.ParseIP(ip),
+			user:    s.req.user,
+			pass:    s.req.pass,
+			proto:   authProtocolWebRTC,
+			id:      &s.uuid,
 		},
 	})
 	if res.err != nil {
@@ -304,15 +402,18 @@ func (s *webRTCSession) runPublish() (int, error) {
 
 	defer res.path.removePublisher(pathRemovePublisherReq{author: s})
 
-	servers, err := s.parent.generateICEServers()
+	iceServers, err := s.parent.generateICEServers()
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
 
-	pc, err := webrtcpc.New(
-		servers,
-		s.api,
-		s)
+	pc := &webrtc.PeerConnection{
+		ICEServers: iceServers,
+		API:        s.api,
+		Publish:    false,
+		Log:        s,
+	}
+	err = pc.Start()
 	if err != nil {
 		return http.StatusBadRequest, err
 	}
@@ -326,59 +427,26 @@ func (s *webRTCSession) runPublish() (int, error) {
 		return http.StatusBadRequest, err
 	}
 
-	trackCount, err := webrtcTrackCount(sdp.MediaDescriptions)
+	trackCount, err := webrtc.TrackCount(sdp.MediaDescriptions)
+	if err != nil {
+		// RFC draft-ietf-wish-whip
+		// if the number of audio and or video
+		// tracks or number streams is not supported by the WHIP Endpoint, it
+		// MUST reject the HTTP POST request with a "406 Not Acceptable" error
+		// response.
+		return http.StatusNotAcceptable, err
+	}
+
+	answer, err := pc.CreateFullAnswer(s.ctx, offer)
 	if err != nil {
 		return http.StatusBadRequest, err
 	}
 
-	_, err = pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RtpTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionRecvonly,
-	})
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	_, err = pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RtpTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionRecvonly,
-	})
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	trackRecv := make(chan trackRecvPair)
-
-	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		select {
-		case trackRecv <- trackRecvPair{track, receiver}:
-		case <-s.ctx.Done():
-		}
-	})
-
-	err = pc.SetRemoteDescription(*offer)
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	answer, err := pc.CreateAnswer(nil)
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	err = pc.SetLocalDescription(answer)
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	err = pc.WaitGatheringDone(s.ctx)
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	s.writeAnswer(pc.LocalDescription())
+	s.writeAnswer(answer)
 
 	go s.readRemoteCandidates(pc)
 
-	err = webrtcWaitUntilConnected(s.ctx, pc)
+	err = pc.WaitUntilConnected(s.ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -387,11 +455,12 @@ func (s *webRTCSession) runPublish() (int, error) {
 	s.pc = pc
 	s.mutex.Unlock()
 
-	tracks, err := webrtcGatherIncomingTracks(s.ctx, pc, trackRecv, trackCount)
+	tracks, err := pc.GatherIncomingTracks(s.ctx, trackCount)
 	if err != nil {
 		return 0, err
 	}
-	medias := webrtcMediasOfIncomingTracks(tracks)
+
+	medias := webrtc.TracksToMedias(tracks)
 
 	rres := res.path.startPublisher(pathStartPublisherReq{
 		author:             s,
@@ -404,8 +473,26 @@ func (s *webRTCSession) runPublish() (int, error) {
 
 	timeDecoder := rtptime.NewGlobalDecoder()
 
-	for _, track := range tracks {
-		track.start(rres.stream, timeDecoder)
+	for i, media := range medias {
+		ci := i
+		cmedia := media
+		trackWrapper := &webrtc.TrackWrapper{ClockRat: cmedia.Formats[0].ClockRate()}
+
+		go func() {
+			for {
+				pkt, err := tracks[ci].ReadRTP()
+				if err != nil {
+					return
+				}
+
+				pts, ok := timeDecoder.Decode(trackWrapper, pkt)
+				if !ok {
+					continue
+				}
+
+				rres.stream.WriteRTPPacket(cmedia, cmedia.Formats[0], pkt, time.Now(), pts)
+			}
+		}()
 	}
 
 	select {
@@ -421,9 +508,9 @@ func (s *webRTCSession) runRead() (int, error) {
 	ip, _, _ := net.SplitHostPort(s.req.remoteAddr)
 
 	res := s.pathManager.addReader(pathAddReaderReq{
-		author:   s,
-		pathName: s.req.pathName,
-		credentials: authCredentials{
+		author: s,
+		accessRequest: pathAccessRequest{
+			name:  s.req.pathName,
 			query: s.req.query,
 			ip:    net.ParseIP(ip),
 			user:  s.req.user,
@@ -449,60 +536,50 @@ func (s *webRTCSession) runRead() (int, error) {
 
 	defer res.path.removeReader(pathRemoveReaderReq{author: s})
 
-	tracks, err := webrtcGatherOutgoingTracks(res.stream.Desc())
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	servers, err := s.parent.generateICEServers()
+	iceServers, err := s.parent.generateICEServers()
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
 
-	pc, err := webrtcpc.New(
-		servers,
-		s.api,
-		s)
+	pc := &webrtc.PeerConnection{
+		ICEServers: iceServers,
+		API:        s.api,
+		Publish:    false,
+		Log:        s,
+	}
+	err = pc.Start()
 	if err != nil {
 		return http.StatusBadRequest, err
 	}
 	defer pc.Close()
 
-	for _, track := range tracks {
-		var err error
-		track.sender, err = pc.AddTrack(track.track)
-		if err != nil {
-			return http.StatusBadRequest, err
-		}
+	writer := asyncwriter.New(s.writeQueueSize, s)
+
+	videoTrack, videoSetup := webrtcFindVideoTrack(res.stream, writer)
+	audioTrack, audioSetup := webrtcFindAudioTrack(res.stream, writer)
+
+	if videoTrack == nil && audioTrack == nil {
+		return http.StatusBadRequest, fmt.Errorf(
+			"the stream doesn't contain any supported codec, which are currently AV1, VP9, VP8, H264, Opus, G722, G711")
+	}
+
+	tracks, err := pc.SetupOutgoingTracks(videoTrack, audioTrack)
+	if err != nil {
+		return http.StatusBadRequest, err
 	}
 
 	offer := whipOffer(s.req.offer)
 
-	err = pc.SetRemoteDescription(*offer)
+	answer, err := pc.CreateFullAnswer(s.ctx, offer)
 	if err != nil {
 		return http.StatusBadRequest, err
 	}
 
-	answer, err := pc.CreateAnswer(nil)
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	err = pc.SetLocalDescription(answer)
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	err = pc.WaitGatheringDone(s.ctx)
-	if err != nil {
-		return http.StatusBadRequest, err
-	}
-
-	s.writeAnswer(pc.LocalDescription())
+	s.writeAnswer(answer)
 
 	go s.readRemoteCandidates(pc)
 
-	err = webrtcWaitUntilConnected(s.ctx, pc)
+	err = pc.WaitUntilConnected(s.ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -511,46 +588,69 @@ func (s *webRTCSession) runRead() (int, error) {
 	s.pc = pc
 	s.mutex.Unlock()
 
-	writer := newAsyncWriter(s.writeQueueSize, s)
+	defer res.stream.RemoveReader(writer)
 
-	for _, track := range tracks {
-		track.start(s, res.stream, writer)
+	n := 0
+
+	if videoTrack != nil {
+		err := videoSetup(tracks[n])
+		if err != nil {
+			return 0, err
+		}
+		n++
 	}
 
-	defer res.stream.RemoveReader(s)
+	if audioTrack != nil {
+		err := audioSetup(tracks[n])
+		if err != nil {
+			return 0, err
+		}
+	}
 
 	s.Log(logger.Info, "is reading from path '%s', %s",
-		res.path.name, sourceMediaInfo(webrtcMediasOfOutgoingTracks(tracks)))
+		res.path.name, readerMediaInfo(writer, res.stream))
 
-	writer.start()
+	pathConf := res.path.safeConf()
+
+	onUnreadHook := onReadHook(
+		s.externalCmdPool,
+		pathConf,
+		res.path,
+		s.apiReaderDescribe(),
+		s.req.query,
+		s,
+	)
+	defer onUnreadHook()
+
+	writer.Start()
 
 	select {
 	case <-pc.Disconnected():
-		writer.stop()
+		writer.Stop()
 		return 0, fmt.Errorf("peer connection closed")
 
-	case err := <-writer.error():
+	case err := <-writer.Error():
 		return 0, err
 
 	case <-s.ctx.Done():
-		writer.stop()
+		writer.Stop()
 		return 0, fmt.Errorf("terminated")
 	}
 }
 
-func (s *webRTCSession) writeAnswer(answer *webrtc.SessionDescription) {
+func (s *webRTCSession) writeAnswer(answer *pwebrtc.SessionDescription) {
 	s.req.res <- webRTCNewSessionRes{
 		sx:     s,
 		answer: []byte(answer.SDP),
 	}
 }
 
-func (s *webRTCSession) readRemoteCandidates(pc *webrtcpc.PeerConnection) {
+func (s *webRTCSession) readRemoteCandidates(pc *webrtc.PeerConnection) {
 	for {
 		select {
 		case req := <-s.chAddCandidates:
 			for _, candidate := range req.candidates {
-				err := pc.AddICECandidate(*candidate)
+				err := pc.AddRemoteCandidate(*candidate)
 				if err != nil {
 					req.res <- webRTCAddSessionCandidatesRes{err: err}
 				}
@@ -587,20 +687,20 @@ func (s *webRTCSession) addCandidates(
 	}
 }
 
-// apiSourceDescribe implements sourceStaticImpl.
-func (s *webRTCSession) apiSourceDescribe() pathAPISourceOrReader {
-	return pathAPISourceOrReader{
+// apiReaderDescribe implements reader.
+func (s *webRTCSession) apiReaderDescribe() defs.APIPathSourceOrReader {
+	return defs.APIPathSourceOrReader{
 		Type: "webRTCSession",
 		ID:   s.uuid.String(),
 	}
 }
 
-// apiReaderDescribe implements reader.
-func (s *webRTCSession) apiReaderDescribe() pathAPISourceOrReader {
-	return s.apiSourceDescribe()
+// APISourceDescribe implements source.
+func (s *webRTCSession) APISourceDescribe() defs.APIPathSourceOrReader {
+	return s.apiReaderDescribe()
 }
 
-func (s *webRTCSession) apiItem() *apiWebRTCSession {
+func (s *webRTCSession) apiItem() *defs.APIWebRTCSession {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
@@ -618,18 +718,18 @@ func (s *webRTCSession) apiItem() *apiWebRTCSession {
 		bytesSent = s.pc.BytesSent()
 	}
 
-	return &apiWebRTCSession{
+	return &defs.APIWebRTCSession{
 		ID:                        s.uuid,
 		Created:                   s.created,
 		RemoteAddr:                s.req.remoteAddr,
 		PeerConnectionEstablished: peerConnectionEstablished,
 		LocalCandidate:            localCandidate,
 		RemoteCandidate:           remoteCandidate,
-		State: func() apiWebRTCSessionState {
+		State: func() defs.APIWebRTCSessionState {
 			if s.req.publish {
-				return apiWebRTCSessionStatePublish
+				return defs.APIWebRTCSessionStatePublish
 			}
-			return apiWebRTCSessionStateRead
+			return defs.APIWebRTCSessionStateRead
 		}(),
 		Path:          s.req.pathName,
 		BytesReceived: bytesReceived,

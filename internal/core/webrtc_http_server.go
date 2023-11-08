@@ -6,17 +6,20 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/pion/webrtc/v3"
+	pwebrtc "github.com/pion/webrtc/v3"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
-	"github.com/bluenviron/mediamtx/internal/httpserv"
+	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/logger"
-	"github.com/bluenviron/mediamtx/internal/whip"
+	"github.com/bluenviron/mediamtx/internal/protocols/httpserv"
+	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
+	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
 )
 
 //go:embed webrtc_publish_index.html
@@ -25,11 +28,34 @@ var webrtcPublishIndex []byte
 //go:embed webrtc_read_index.html
 var webrtcReadIndex []byte
 
+var (
+	reWHIPWHEPNoID   = regexp.MustCompile("^/(.+?)/(whip|whep)$")
+	reWHIPWHEPWithID = regexp.MustCompile("^/(.+?)/(whip|whep)/(.+?)$")
+)
+
+func webrtcWriteError(ctx *gin.Context, statusCode int, err error) {
+	ctx.JSON(statusCode, &defs.APIError{
+		Error: err.Error(),
+	})
+}
+
+func sessionLocation(publish bool, secret uuid.UUID) string {
+	ret := ""
+	if publish {
+		ret += "whip"
+	} else {
+		ret += "whep"
+	}
+	ret += "/" + secret.String()
+	return ret
+}
+
 type webRTCHTTPServerParent interface {
 	logger.Writer
-	generateICEServers() ([]webrtc.ICEServer, error)
+	generateICEServers() ([]pwebrtc.ICEServer, error)
 	newSession(req webRTCNewSessionReq) webRTCNewSessionRes
 	addSessionCandidates(req webRTCAddSessionCandidatesReq) webRTCAddSessionCandidatesRes
+	deleteSession(req webRTCDeleteSessionReq) error
 }
 
 type webRTCHTTPServer struct {
@@ -70,7 +96,7 @@ func newWebRTCHTTPServer( //nolint:dupl
 	router.SetTrustedProxies(trustedProxies.ToTrustedProxies()) //nolint:errcheck
 	router.NoRoute(s.onRequest)
 
-	network, address := restrictNetwork("tcp", address)
+	network, address := restrictnetwork.Restrict("tcp", address)
 
 	var err error
 	s.inner, err = httpserv.NewWrappedServer(
@@ -97,213 +123,242 @@ func (s *webRTCHTTPServer) close() {
 	s.inner.Close()
 }
 
-func (s *webRTCHTTPServer) onRequest(ctx *gin.Context) {
-	ctx.Writer.Header().Set("Access-Control-Allow-Origin", s.allowOrigin)
-	ctx.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+func (s *webRTCHTTPServer) checkAuthOutsideSession(ctx *gin.Context, path string, publish bool) bool {
+	ip := ctx.ClientIP()
+	_, port, _ := net.SplitHostPort(ctx.Request.RemoteAddr)
+	remoteAddr := net.JoinHostPort(ip, port)
+	user, pass, hasCredentials := ctx.Request.BasicAuth()
 
-	// remove leading prefix
-	pa := ctx.Request.URL.Path[1:]
-
-	isWHIPorWHEP := strings.HasSuffix(pa, "/whip") || strings.HasSuffix(pa, "/whep")
-	isPreflight := ctx.Request.Method == http.MethodOptions &&
-		ctx.Request.Header.Get("Access-Control-Request-Method") != ""
-
-	if !isWHIPorWHEP || isPreflight {
-		switch ctx.Request.Method {
-		case http.MethodOptions:
-			ctx.Writer.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PATCH")
-			ctx.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match")
-			ctx.Writer.WriteHeader(http.StatusNoContent)
-			return
-
-		case http.MethodGet:
-
-		default:
-			return
-		}
-	}
-
-	var dir string
-	var fname string
-	var publish bool
-
-	switch {
-	case pa == "", pa == "favicon.ico":
-		return
-
-	case strings.HasSuffix(pa, "/publish"):
-		dir, fname = pa[:len(pa)-len("/publish")], "publish"
-		publish = true
-
-	case strings.HasSuffix(pa, "/whip"):
-		dir, fname = pa[:len(pa)-len("/whip")], "whip"
-		publish = true
-
-	case strings.HasSuffix(pa, "/whep"):
-		dir, fname = pa[:len(pa)-len("/whep")], "whep"
-		publish = false
-
-	default:
-		dir, fname = pa, ""
-		publish = false
-
-		if !strings.HasSuffix(dir, "/") {
-			l := "/" + dir + "/"
-			if ctx.Request.URL.RawQuery != "" {
-				l += "?" + ctx.Request.URL.RawQuery
+	res := s.pathManager.getConfForPath(pathGetConfForPathReq{
+		accessRequest: pathAccessRequest{
+			name:    path,
+			query:   ctx.Request.URL.RawQuery,
+			publish: publish,
+			ip:      net.ParseIP(ip),
+			user:    user,
+			pass:    pass,
+			proto:   authProtocolWebRTC,
+		},
+	})
+	if res.err != nil {
+		if terr, ok := res.err.(*errAuthentication); ok {
+			if !hasCredentials {
+				ctx.Header("WWW-Authenticate", `Basic realm="mediamtx"`)
+				ctx.Writer.WriteHeader(http.StatusUnauthorized)
+				return false
 			}
-			ctx.Writer.Header().Set("Location", l)
-			ctx.Writer.WriteHeader(http.StatusMovedPermanently)
-			return
+
+			s.Log(logger.Info, "connection %v failed to authenticate: %v", remoteAddr, terr.message)
+
+			// wait some seconds to stop brute force attacks
+			<-time.After(webrtcPauseAfterAuthError)
+
+			webrtcWriteError(ctx, http.StatusUnauthorized, terr)
+			return false
 		}
+
+		webrtcWriteError(ctx, http.StatusInternalServerError, res.err)
+		return false
 	}
 
-	dir = strings.TrimSuffix(dir, "/")
-	if dir == "" {
+	return true
+}
+
+func (s *webRTCHTTPServer) onWHIPOptions(ctx *gin.Context, path string, publish bool) {
+	if !s.checkAuthOutsideSession(ctx, path, publish) {
+		return
+	}
+
+	servers, err := s.parent.generateICEServers()
+	if err != nil {
+		webrtcWriteError(ctx, http.StatusInternalServerError, err)
+		return
+	}
+
+	ctx.Writer.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PATCH, DELETE")
+	ctx.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match")
+	ctx.Writer.Header().Set("Access-Control-Expose-Headers", "Link")
+	ctx.Writer.Header()["Link"] = webrtc.LinkHeaderMarshal(servers)
+	ctx.Writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *webRTCHTTPServer) onWHIPPost(ctx *gin.Context, path string, publish bool) {
+	if ctx.Request.Header.Get("Content-Type") != "application/sdp" {
+		webrtcWriteError(ctx, http.StatusBadRequest, fmt.Errorf("invalid Content-Type"))
+		return
+	}
+
+	offer, err := io.ReadAll(ctx.Request.Body)
+	if err != nil {
 		return
 	}
 
 	ip := ctx.ClientIP()
 	_, port, _ := net.SplitHostPort(ctx.Request.RemoteAddr)
 	remoteAddr := net.JoinHostPort(ip, port)
-	user, pass, hasCredentials := ctx.Request.BasicAuth()
+	user, pass, _ := ctx.Request.BasicAuth()
 
-	// if request doesn't belong to a session, check authentication here
-	if !isWHIPorWHEP || ctx.Request.Method == http.MethodOptions {
-		res := s.pathManager.getConfForPath(pathGetConfForPathReq{
-			name:    dir,
-			publish: publish,
-			credentials: authCredentials{
-				query: ctx.Request.URL.RawQuery,
-				ip:    net.ParseIP(ip),
-				user:  user,
-				pass:  pass,
-				proto: authProtocolWebRTC,
-			},
-		})
-		if res.err != nil {
-			if terr, ok := res.err.(*errAuthentication); ok {
-				if !hasCredentials {
-					ctx.Header("WWW-Authenticate", `Basic realm="mediamtx"`)
-					ctx.Writer.WriteHeader(http.StatusUnauthorized)
-					return
-				}
-
-				s.Log(logger.Info, "connection %v failed to authenticate: %v", remoteAddr, terr.message)
-
-				// wait some seconds to stop brute force attacks
-				<-time.After(webrtcPauseAfterAuthError)
-
-				ctx.Writer.WriteHeader(http.StatusUnauthorized)
-				return
-			}
-
-			ctx.Writer.WriteHeader(http.StatusNotFound)
-			return
-		}
+	res := s.parent.newSession(webRTCNewSessionReq{
+		pathName:   path,
+		remoteAddr: remoteAddr,
+		query:      ctx.Request.URL.RawQuery,
+		user:       user,
+		pass:       pass,
+		offer:      offer,
+		publish:    publish,
+	})
+	if res.err != nil {
+		webrtcWriteError(ctx, res.errStatusCode, res.err)
+		return
 	}
 
-	switch fname {
-	case "":
-		ctx.Writer.Header().Set("Cache-Control", "max-age=3600")
-		ctx.Writer.Header().Set("Content-Type", "text/html")
-		ctx.Writer.WriteHeader(http.StatusOK)
-		ctx.Writer.Write(webrtcReadIndex)
+	servers, err := s.parent.generateICEServers()
+	if err != nil {
+		webrtcWriteError(ctx, http.StatusInternalServerError, err)
+		return
+	}
 
-	case "publish":
-		ctx.Writer.Header().Set("Cache-Control", "max-age=3600")
-		ctx.Writer.Header().Set("Content-Type", "text/html")
-		ctx.Writer.WriteHeader(http.StatusOK)
+	ctx.Writer.Header().Set("Content-Type", "application/sdp")
+	ctx.Writer.Header().Set("Access-Control-Expose-Headers", "ETag, ID, Accept-Patch, Link, Location")
+	ctx.Writer.Header().Set("ETag", "*")
+	ctx.Writer.Header().Set("ID", res.sx.uuid.String())
+	ctx.Writer.Header().Set("Accept-Patch", "application/trickle-ice-sdpfrag")
+	ctx.Writer.Header()["Link"] = webrtc.LinkHeaderMarshal(servers)
+	ctx.Writer.Header().Set("Location", sessionLocation(publish, res.sx.secret))
+	ctx.Writer.WriteHeader(http.StatusCreated)
+	ctx.Writer.Write(res.answer)
+}
+
+func (s *webRTCHTTPServer) onWHIPPatch(ctx *gin.Context, rawSecret string) {
+	secret, err := uuid.Parse(rawSecret)
+	if err != nil {
+		webrtcWriteError(ctx, http.StatusBadRequest, fmt.Errorf("invalid secret"))
+		return
+	}
+
+	if ctx.Request.Header.Get("Content-Type") != "application/trickle-ice-sdpfrag" {
+		webrtcWriteError(ctx, http.StatusBadRequest, fmt.Errorf("invalid Content-Type"))
+		return
+	}
+
+	byts, err := io.ReadAll(ctx.Request.Body)
+	if err != nil {
+		return
+	}
+
+	candidates, err := webrtc.ICEFragmentUnmarshal(byts)
+	if err != nil {
+		webrtcWriteError(ctx, http.StatusBadRequest, err)
+		return
+	}
+
+	res := s.parent.addSessionCandidates(webRTCAddSessionCandidatesReq{
+		secret:     secret,
+		candidates: candidates,
+	})
+	if res.err != nil {
+		webrtcWriteError(ctx, http.StatusInternalServerError, res.err)
+		return
+	}
+
+	ctx.Writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *webRTCHTTPServer) onWHIPDelete(ctx *gin.Context, rawSecret string) {
+	secret, err := uuid.Parse(rawSecret)
+	if err != nil {
+		webrtcWriteError(ctx, http.StatusBadRequest, fmt.Errorf("invalid secret"))
+		return
+	}
+
+	err = s.parent.deleteSession(webRTCDeleteSessionReq{
+		secret: secret,
+	})
+	if err != nil {
+		webrtcWriteError(ctx, http.StatusInternalServerError, err)
+		return
+	}
+
+	ctx.Writer.WriteHeader(http.StatusOK)
+}
+
+func (s *webRTCHTTPServer) onPage(ctx *gin.Context, path string, publish bool) {
+	if !s.checkAuthOutsideSession(ctx, path, publish) {
+		return
+	}
+
+	ctx.Writer.Header().Set("Cache-Control", "max-age=3600")
+	ctx.Writer.Header().Set("Content-Type", "text/html")
+	ctx.Writer.WriteHeader(http.StatusOK)
+
+	if publish {
 		ctx.Writer.Write(webrtcPublishIndex)
+	} else {
+		ctx.Writer.Write(webrtcReadIndex)
+	}
+}
 
-	case "whip", "whep":
+func (s *webRTCHTTPServer) onRequest(ctx *gin.Context) {
+	ctx.Writer.Header().Set("Access-Control-Allow-Origin", s.allowOrigin)
+	ctx.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+
+	// preflight requests
+	if ctx.Request.Method == http.MethodOptions &&
+		ctx.Request.Header.Get("Access-Control-Request-Method") != "" {
+		ctx.Writer.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PATCH, DELETE")
+		ctx.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match")
+		ctx.Writer.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// WHIP/WHEP, outside session
+	if m := reWHIPWHEPNoID.FindStringSubmatch(ctx.Request.URL.Path); m != nil {
 		switch ctx.Request.Method {
 		case http.MethodOptions:
-			servers, err := s.parent.generateICEServers()
-			if err != nil {
-				ctx.Writer.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			ctx.Writer.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PATCH")
-			ctx.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match")
-			ctx.Writer.Header()["Link"] = whip.LinkHeaderMarshal(servers)
-			ctx.Writer.WriteHeader(http.StatusNoContent)
+			s.onWHIPOptions(ctx, m[1], m[2] == "whip")
 
 		case http.MethodPost:
-			if ctx.Request.Header.Get("Content-Type") != "application/sdp" {
-				ctx.Writer.WriteHeader(http.StatusBadRequest)
-				return
-			}
+			s.onWHIPPost(ctx, m[1], m[2] == "whip")
 
-			offer, err := io.ReadAll(ctx.Request.Body)
-			if err != nil {
-				return
-			}
-
-			res := s.parent.newSession(webRTCNewSessionReq{
-				pathName:   dir,
-				remoteAddr: remoteAddr,
-				query:      ctx.Request.URL.RawQuery,
-				user:       user,
-				pass:       pass,
-				offer:      offer,
-				publish:    (fname == "whip"),
-			})
-			if res.err != nil {
-				ctx.Writer.WriteHeader(res.errStatusCode)
-				return
-			}
-
-			servers, err := s.parent.generateICEServers()
-			if err != nil {
-				ctx.Writer.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			ctx.Writer.Header().Set("Content-Type", "application/sdp")
-			ctx.Writer.Header().Set("Access-Control-Expose-Headers", "E-Tag, Accept-Patch, Link")
-			ctx.Writer.Header().Set("E-Tag", res.sx.secret.String())
-			ctx.Writer.Header().Set("ID", res.sx.uuid.String())
-			ctx.Writer.Header().Set("Accept-Patch", "application/trickle-ice-sdpfrag")
-			ctx.Writer.Header()["Link"] = whip.LinkHeaderMarshal(servers)
-			ctx.Writer.Header().Set("Location", ctx.Request.URL.String())
-			ctx.Writer.WriteHeader(http.StatusCreated)
-			ctx.Writer.Write(res.answer)
-
-		case http.MethodPatch:
-			secret, err := uuid.Parse(ctx.Request.Header.Get("If-Match"))
-			if err != nil {
-				ctx.Writer.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			if ctx.Request.Header.Get("Content-Type") != "application/trickle-ice-sdpfrag" {
-				ctx.Writer.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			byts, err := io.ReadAll(ctx.Request.Body)
-			if err != nil {
-				return
-			}
-
-			candidates, err := whip.ICEFragmentUnmarshal(byts)
-			if err != nil {
-				ctx.Writer.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			res := s.parent.addSessionCandidates(webRTCAddSessionCandidatesReq{
-				secret:     secret,
-				candidates: candidates,
-			})
-			if res.err != nil {
-				ctx.Writer.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			ctx.Writer.WriteHeader(http.StatusNoContent)
+		case http.MethodGet, http.MethodHead, http.MethodPut:
+			// RFC draft-ietf-whip-09
+			// The WHIP endpoints MUST return an "405 Method Not Allowed" response
+			// for any HTTP GET, HEAD or PUT requests
+			webrtcWriteError(ctx, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		}
+		return
+	}
+
+	// WHIP/WHEP, inside session
+	if m := reWHIPWHEPWithID.FindStringSubmatch(ctx.Request.URL.Path); m != nil {
+		switch ctx.Request.Method {
+		case http.MethodPatch:
+			s.onWHIPPatch(ctx, m[3])
+
+		case http.MethodDelete:
+			s.onWHIPDelete(ctx, m[3])
+		}
+		return
+	}
+
+	// static resources
+	if ctx.Request.Method == http.MethodGet {
+		switch {
+		case ctx.Request.URL.Path == "/favicon.ico":
+
+		case len(ctx.Request.URL.Path) >= 2:
+			switch {
+			case strings.HasSuffix(ctx.Request.URL.Path, "/publish"):
+				s.onPage(ctx, ctx.Request.URL.Path[1:len(ctx.Request.URL.Path)-len("/publish")], true)
+
+			case ctx.Request.URL.Path[len(ctx.Request.URL.Path)-1] != '/':
+				ctx.Writer.Header().Set("Location", ctx.Request.URL.Path[1:]+"/")
+				ctx.Writer.WriteHeader(http.StatusMovedPermanently)
+
+			default:
+				s.onPage(ctx, ctx.Request.URL.Path[1:len(ctx.Request.URL.Path)-1], false)
+			}
+		}
+		return
 	}
 }

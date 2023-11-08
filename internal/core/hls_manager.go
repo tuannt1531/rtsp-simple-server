@@ -7,11 +7,12 @@ import (
 	"sync"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
 
 type hlsManagerAPIMuxersListRes struct {
-	data *apiHLSMuxersList
+	data *defs.APIHLSMuxerList
 	err  error
 }
 
@@ -20,7 +21,7 @@ type hlsManagerAPIMuxersListReq struct {
 }
 
 type hlsManagerAPIMuxersGetRes struct {
-	data *apiHLSMuxer
+	data *defs.APIHLSMuxer
 	err  error
 }
 
@@ -142,7 +143,7 @@ func newHLSManager(
 
 // Log is the main logging function.
 func (m *hlsManager) Log(level logger.Level, format string, args ...interface{}) {
-	m.parent.Log(level, "[HLS] "+format, append([]interface{}{}, args...)...)
+	m.parent.Log(level, "[HLS] "+format, args...)
 }
 
 func (m *hlsManager) close() {
@@ -189,8 +190,8 @@ outer:
 			delete(m.muxers, c.PathName())
 
 		case req := <-m.chAPIMuxerList:
-			data := &apiHLSMuxersList{
-				Items: []*apiHLSMuxer{},
+			data := &defs.APIHLSMuxerList{
+				Items: []*defs.APIHLSMuxer{},
 			}
 
 			for _, muxer := range m.muxers {
@@ -208,7 +209,7 @@ outer:
 		case req := <-m.chAPIMuxerGet:
 			muxer, ok := m.muxers[req.name]
 			if !ok {
-				req.res <- hlsManagerAPIMuxersGetRes{err: errAPINotFound}
+				req.res <- hlsManagerAPIMuxersGetRes{err: fmt.Errorf("muxer not found")}
 				continue
 			}
 
@@ -275,7 +276,7 @@ func (m *hlsManager) pathNotReady(pa *path) {
 }
 
 // apiMuxersList is called by api.
-func (m *hlsManager) apiMuxersList() (*apiHLSMuxersList, error) {
+func (m *hlsManager) apiMuxersList() (*defs.APIHLSMuxerList, error) {
 	req := hlsManagerAPIMuxersListReq{
 		res: make(chan hlsManagerAPIMuxersListRes),
 	}
@@ -291,7 +292,7 @@ func (m *hlsManager) apiMuxersList() (*apiHLSMuxersList, error) {
 }
 
 // apiMuxersGet is called by api.
-func (m *hlsManager) apiMuxersGet(name string) (*apiHLSMuxer, error) {
+func (m *hlsManager) apiMuxersGet(name string) (*defs.APIHLSMuxer, error) {
 	req := hlsManagerAPIMuxersGetReq{
 		name: name,
 		res:  make(chan hlsManagerAPIMuxersGetRes),

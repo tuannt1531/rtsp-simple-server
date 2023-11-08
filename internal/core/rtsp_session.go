@@ -15,6 +15,7 @@ import (
 	"github.com/pion/rtp"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
 	"github.com/bluenviron/mediamtx/internal/stream"
@@ -44,7 +45,7 @@ type rtspSession struct {
 	created         time.Time
 	path            *path
 	stream          *stream.Stream
-	onReadCmd       *externalcmd.Cmd // read
+	onUnreadHook    func()
 	mutex           sync.Mutex
 	state           gortsplib.ServerSessionState
 	transport       *gortsplib.Transport
@@ -74,8 +75,8 @@ func newRTSPSession(
 		created:         time.Now(),
 	}
 
-	s.decodeErrLogger = newLimitedLogger(s)
-	s.writeErrLogger = newLimitedLogger(s)
+	s.decodeErrLogger = logger.NewLimitedLogger(s)
+	s.writeErrLogger = logger.NewLimitedLogger(s)
 
 	s.Log(logger.Info, "created by %v", s.author.NetConn().RemoteAddr())
 
@@ -99,11 +100,7 @@ func (s *rtspSession) Log(level logger.Level, format string, args ...interface{}
 // onClose is called by rtspServer.
 func (s *rtspSession) onClose(err error) {
 	if s.session.State() == gortsplib.ServerSessionStatePlay {
-		if s.onReadCmd != nil {
-			s.onReadCmd.Close()
-			s.onReadCmd = nil
-			s.Log(logger.Info, "runOnRead command stopped")
-		}
+		s.onUnreadHook()
 	}
 
 	switch s.session.State() {
@@ -117,7 +114,7 @@ func (s *rtspSession) onClose(err error) {
 	s.path = nil
 	s.stream = nil
 
-	s.Log(logger.Info, "destroyed (%v)", err)
+	s.Log(logger.Info, "destroyed: %v", err)
 }
 
 // onAnnounce is called by rtspServer.
@@ -140,10 +137,11 @@ func (s *rtspSession) onAnnounce(c *rtspConn, ctx *gortsplib.ServerHandlerOnAnno
 	}
 
 	res := s.pathManager.addPublisher(pathAddPublisherReq{
-		author:   s,
-		pathName: ctx.Path,
-		credentials: authCredentials{
+		author: s,
+		accessRequest: pathAccessRequest{
+			name:        ctx.Path,
 			query:       ctx.Query,
+			publish:     true,
 			ip:          c.ip(),
 			proto:       authProtocolRTSP,
 			id:          &c.uuid,
@@ -225,9 +223,9 @@ func (s *rtspSession) onSetup(c *rtspConn, ctx *gortsplib.ServerHandlerOnSetupCt
 		}
 
 		res := s.pathManager.addReader(pathAddReaderReq{
-			author:   s,
-			pathName: ctx.Path,
-			credentials: authCredentials{
+			author: s,
+			accessRequest: pathAccessRequest{
+				name:        ctx.Path,
 				query:       ctx.Query,
 				ip:          c.ip(),
 				proto:       authProtocolRTSP,
@@ -290,21 +288,18 @@ func (s *rtspSession) onPlay(_ *gortsplib.ServerHandlerOnPlayCtx) (*base.Respons
 		s.Log(logger.Info, "is reading from path '%s', with %s, %s",
 			s.path.name,
 			s.session.SetuppedTransport(),
-			sourceMediaInfo(s.session.SetuppedMedias()))
+			mediaInfo(s.session.SetuppedMedias()))
 
 		pathConf := s.path.safeConf()
 
-		if pathConf.RunOnRead != "" {
-			s.Log(logger.Info, "runOnRead command started")
-			s.onReadCmd = externalcmd.NewCmd(
-				s.externalCmdPool,
-				pathConf.RunOnRead,
-				pathConf.RunOnReadRestart,
-				s.path.externalCmdEnv(),
-				func(err error) {
-					s.Log(logger.Info, "runOnRead command exited: %v", err)
-				})
-		}
+		s.onUnreadHook = onReadHook(
+			s.externalCmdPool,
+			pathConf,
+			s.path,
+			s.apiReaderDescribe(),
+			s.session.SetuppedQuery(),
+			s,
+		)
 
 		s.mutex.Lock()
 		s.state = gortsplib.ServerSessionStatePlay
@@ -363,10 +358,7 @@ func (s *rtspSession) onRecord(_ *gortsplib.ServerHandlerOnRecordCtx) (*base.Res
 func (s *rtspSession) onPause(_ *gortsplib.ServerHandlerOnPauseCtx) (*base.Response, error) {
 	switch s.session.State() {
 	case gortsplib.ServerSessionStatePlay:
-		if s.onReadCmd != nil {
-			s.Log(logger.Info, "runOnRead command stopped")
-			s.onReadCmd.Close()
-		}
+		s.onUnreadHook()
 
 		s.mutex.Lock()
 		s.state = gortsplib.ServerSessionStatePrePlay
@@ -386,8 +378,8 @@ func (s *rtspSession) onPause(_ *gortsplib.ServerHandlerOnPauseCtx) (*base.Respo
 }
 
 // apiReaderDescribe implements reader.
-func (s *rtspSession) apiReaderDescribe() pathAPISourceOrReader {
-	return pathAPISourceOrReader{
+func (s *rtspSession) apiReaderDescribe() defs.APIPathSourceOrReader {
+	return defs.APIPathSourceOrReader{
 		Type: func() string {
 			if s.isTLS {
 				return "rtspsSession"
@@ -398,8 +390,8 @@ func (s *rtspSession) apiReaderDescribe() pathAPISourceOrReader {
 	}
 }
 
-// apiSourceDescribe implements source.
-func (s *rtspSession) apiSourceDescribe() pathAPISourceOrReader {
+// APISourceDescribe implements source.
+func (s *rtspSession) APISourceDescribe() defs.APIPathSourceOrReader {
 	return s.apiReaderDescribe()
 }
 
@@ -418,25 +410,25 @@ func (s *rtspSession) onStreamWriteError(ctx *gortsplib.ServerHandlerOnStreamWri
 	s.writeErrLogger.Log(logger.Warn, ctx.Error.Error())
 }
 
-func (s *rtspSession) apiItem() *apiRTSPSession {
+func (s *rtspSession) apiItem() *defs.APIRTSPSession {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	return &apiRTSPSession{
+	return &defs.APIRTSPSession{
 		ID:         s.uuid,
 		Created:    s.created,
 		RemoteAddr: s.remoteAddr().String(),
-		State: func() apiRTSPSessionState {
+		State: func() defs.APIRTSPSessionState {
 			switch s.state {
 			case gortsplib.ServerSessionStatePrePlay,
 				gortsplib.ServerSessionStatePlay:
-				return apiRTSPSessionStateRead
+				return defs.APIRTSPSessionStateRead
 
 			case gortsplib.ServerSessionStatePreRecord,
 				gortsplib.ServerSessionStateRecord:
-				return apiRTSPSessionStatePublish
+				return defs.APIRTSPSessionStatePublish
 			}
-			return apiRTSPSessionStateIdle
+			return defs.APIRTSPSessionStateIdle
 		}(),
 		Path: s.pathName,
 		Transport: func() *string {

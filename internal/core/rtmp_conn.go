@@ -17,10 +17,12 @@ import (
 	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
 	"github.com/google/uuid"
 
+	"github.com/bluenviron/mediamtx/internal/asyncwriter"
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
-	"github.com/bluenviron/mediamtx/internal/rtmp"
+	"github.com/bluenviron/mediamtx/internal/protocols/rtmp"
 	"github.com/bluenviron/mediamtx/internal/stream"
 	"github.com/bluenviron/mediamtx/internal/unit"
 )
@@ -55,25 +57,24 @@ type rtmpConnParent interface {
 }
 
 type rtmpConn struct {
-	isTLS               bool
-	rtspAddress         string
-	readTimeout         conf.StringDuration
-	writeTimeout        conf.StringDuration
-	writeQueueSize      int
-	runOnConnect        string
-	runOnConnectRestart bool
-	wg                  *sync.WaitGroup
-	nconn               net.Conn
-	externalCmdPool     *externalcmd.Pool
-	pathManager         rtmpConnPathManager
-	parent              rtmpConnParent
+	*conn
+
+	isTLS           bool
+	readTimeout     conf.StringDuration
+	writeTimeout    conf.StringDuration
+	writeQueueSize  int
+	wg              *sync.WaitGroup
+	nconn           net.Conn
+	externalCmdPool *externalcmd.Pool
+	pathManager     rtmpConnPathManager
+	parent          rtmpConnParent
 
 	ctx       context.Context
 	ctxCancel func()
 	uuid      uuid.UUID
 	created   time.Time
 	mutex     sync.RWMutex
-	conn      *rtmp.Conn
+	rconn     *rtmp.Conn
 	state     rtmpConnState
 	pathName  string
 }
@@ -87,6 +88,7 @@ func newRTMPConn(
 	writeQueueSize int,
 	runOnConnect string,
 	runOnConnectRestart bool,
+	runOnDisconnect string,
 	wg *sync.WaitGroup,
 	nconn net.Conn,
 	externalCmdPool *externalcmd.Pool,
@@ -96,23 +98,29 @@ func newRTMPConn(
 	ctx, ctxCancel := context.WithCancel(parentCtx)
 
 	c := &rtmpConn{
-		isTLS:               isTLS,
-		rtspAddress:         rtspAddress,
-		readTimeout:         readTimeout,
-		writeTimeout:        writeTimeout,
-		writeQueueSize:      writeQueueSize,
-		runOnConnect:        runOnConnect,
-		runOnConnectRestart: runOnConnectRestart,
-		wg:                  wg,
-		nconn:               nconn,
-		externalCmdPool:     externalCmdPool,
-		pathManager:         pathManager,
-		parent:              parent,
-		ctx:                 ctx,
-		ctxCancel:           ctxCancel,
-		uuid:                uuid.New(),
-		created:             time.Now(),
+		isTLS:           isTLS,
+		readTimeout:     readTimeout,
+		writeTimeout:    writeTimeout,
+		writeQueueSize:  writeQueueSize,
+		wg:              wg,
+		nconn:           nconn,
+		externalCmdPool: externalCmdPool,
+		pathManager:     pathManager,
+		parent:          parent,
+		ctx:             ctx,
+		ctxCancel:       ctxCancel,
+		uuid:            uuid.New(),
+		created:         time.Now(),
 	}
+
+	c.conn = newConn(
+		rtspAddress,
+		runOnConnect,
+		runOnConnectRestart,
+		runOnDisconnect,
+		externalCmdPool,
+		c,
+	)
 
 	c.Log(logger.Info, "opened")
 
@@ -138,30 +146,12 @@ func (c *rtmpConn) ip() net.IP {
 	return c.nconn.RemoteAddr().(*net.TCPAddr).IP
 }
 
-func (c *rtmpConn) run() {
+func (c *rtmpConn) run() { //nolint:dupl
 	defer c.wg.Done()
 
-	if c.runOnConnect != "" {
-		c.Log(logger.Info, "runOnConnect command started")
-		_, port, _ := net.SplitHostPort(c.rtspAddress)
-		onConnectCmd := externalcmd.NewCmd(
-			c.externalCmdPool,
-			c.runOnConnect,
-			c.runOnConnectRestart,
-			externalcmd.Environment{
-				"MTX_PATH":  "",
-				"RTSP_PATH": "", // deprecated
-				"RTSP_PORT": port,
-			},
-			func(err error) {
-				c.Log(logger.Info, "runOnConnect command exited: %v", err)
-			})
-
-		defer func() {
-			onConnectCmd.Close()
-			c.Log(logger.Info, "runOnConnect command stopped")
-		}()
-	}
+	desc := c.apiReaderDescribe()
+	c.conn.open(desc)
+	defer c.conn.close()
 
 	err := c.runInner()
 
@@ -169,7 +159,7 @@ func (c *rtmpConn) run() {
 
 	c.parent.closeConn(c)
 
-	c.Log(logger.Info, "closed (%v)", err)
+	c.Log(logger.Info, "closed: %v", err)
 }
 
 func (c *rtmpConn) runInner() error {
@@ -199,7 +189,7 @@ func (c *rtmpConn) runReader() error {
 	}
 
 	c.mutex.Lock()
-	c.conn = conn
+	c.rconn = conn
 	c.mutex.Unlock()
 
 	if !publish {
@@ -212,9 +202,9 @@ func (c *rtmpConn) runRead(conn *rtmp.Conn, u *url.URL) error {
 	pathName, query, rawQuery := pathNameAndQuery(u)
 
 	res := c.pathManager.addReader(pathAddReaderReq{
-		author:   c,
-		pathName: pathName,
-		credentials: authCredentials{
+		author: c,
+		accessRequest: pathAccessRequest{
+			name:  pathName,
 			query: rawQuery,
 			ip:    c.ip(),
 			user:  query.Get("user"),
@@ -240,54 +230,40 @@ func (c *rtmpConn) runRead(conn *rtmp.Conn, u *url.URL) error {
 	c.pathName = pathName
 	c.mutex.Unlock()
 
-	writer := newAsyncWriter(c.writeQueueSize, c)
+	writer := asyncwriter.New(c.writeQueueSize, c)
 
-	var medias []*description.Media
+	defer res.stream.RemoveReader(writer)
+
 	var w *rtmp.Writer
 
-	videoMedia, videoFormat := c.setupVideo(
+	videoFormat := c.setupVideo(
 		&w,
 		res.stream,
 		writer)
-	if videoMedia != nil {
-		medias = append(medias, videoMedia)
-	}
 
-	audioMedia, audioFormat := c.setupAudio(
+	audioFormat := c.setupAudio(
 		&w,
 		res.stream,
 		writer)
-	if audioFormat != nil {
-		medias = append(medias, audioMedia)
-	}
 
 	if videoFormat == nil && audioFormat == nil {
 		return fmt.Errorf(
 			"the stream doesn't contain any supported codec, which are currently H264, MPEG-4 Audio, MPEG-1/2 Audio")
 	}
 
-	defer res.stream.RemoveReader(c)
-
 	c.Log(logger.Info, "is reading from path '%s', %s",
-		res.path.name, sourceMediaInfo(medias))
+		res.path.name, readerMediaInfo(writer, res.stream))
 
 	pathConf := res.path.safeConf()
 
-	if pathConf.RunOnRead != "" {
-		c.Log(logger.Info, "runOnRead command started")
-		onReadCmd := externalcmd.NewCmd(
-			c.externalCmdPool,
-			pathConf.RunOnRead,
-			pathConf.RunOnReadRestart,
-			res.path.externalCmdEnv(),
-			func(err error) {
-				c.Log(logger.Info, "runOnRead command exited: %v", err)
-			})
-		defer func() {
-			onReadCmd.Close()
-			c.Log(logger.Info, "runOnRead command stopped")
-		}()
-	}
+	onUnreadHook := onReadHook(
+		c.externalCmdPool,
+		pathConf,
+		res.path,
+		c.apiReaderDescribe(),
+		rawQuery,
+		c)
+	defer onUnreadHook()
 
 	var err error
 	w, err = rtmp.NewWriter(conn, videoFormat, audioFormat)
@@ -298,14 +274,14 @@ func (c *rtmpConn) runRead(conn *rtmp.Conn, u *url.URL) error {
 	// disable read deadline
 	c.nconn.SetReadDeadline(time.Time{})
 
-	writer.start()
+	writer.Start()
 
 	select {
 	case <-c.ctx.Done():
-		writer.stop()
+		writer.Stop()
 		return fmt.Errorf("terminated")
 
-	case err := <-writer.error():
+	case err := <-writer.Error():
 		return err
 	}
 }
@@ -313,193 +289,159 @@ func (c *rtmpConn) runRead(conn *rtmp.Conn, u *url.URL) error {
 func (c *rtmpConn) setupVideo(
 	w **rtmp.Writer,
 	stream *stream.Stream,
-	writer *asyncWriter,
-) (*description.Media, format.Format) {
+	writer *asyncwriter.Writer,
+) format.Format {
 	var videoFormatH264 *format.H264
 	videoMedia := stream.Desc().FindFormat(&videoFormatH264)
 
 	if videoFormatH264 != nil {
 		var videoDTSExtractor *h264.DTSExtractor
 
-		stream.AddReader(c, videoMedia, videoFormatH264, func(u unit.Unit) {
-			writer.push(func() error {
-				tunit := u.(*unit.H264)
+		stream.AddReader(writer, videoMedia, videoFormatH264, func(u unit.Unit) error {
+			tunit := u.(*unit.H264)
 
-				if tunit.AU == nil {
+			if tunit.AU == nil {
+				return nil
+			}
+
+			idrPresent := false
+			nonIDRPresent := false
+
+			for _, nalu := range tunit.AU {
+				typ := h264.NALUType(nalu[0] & 0x1F)
+				switch typ {
+				case h264.NALUTypeIDR:
+					idrPresent = true
+
+				case h264.NALUTypeNonIDR:
+					nonIDRPresent = true
+				}
+			}
+
+			var dts time.Duration
+
+			// wait until we receive an IDR
+			if videoDTSExtractor == nil {
+				if !idrPresent {
 					return nil
 				}
 
-				pts := tunit.PTS
+				videoDTSExtractor = h264.NewDTSExtractor()
 
-				idrPresent := false
-				nonIDRPresent := false
-
-				for _, nalu := range tunit.AU {
-					typ := h264.NALUType(nalu[0] & 0x1F)
-					switch typ {
-					case h264.NALUTypeIDR:
-						idrPresent = true
-
-					case h264.NALUTypeNonIDR:
-						nonIDRPresent = true
-					}
+				var err error
+				dts, err = videoDTSExtractor.Extract(tunit.AU, tunit.PTS)
+				if err != nil {
+					return err
+				}
+			} else {
+				if !idrPresent && !nonIDRPresent {
+					return nil
 				}
 
-				var dts time.Duration
-
-				// wait until we receive an IDR
-				if videoDTSExtractor == nil {
-					if !idrPresent {
-						return nil
-					}
-
-					videoDTSExtractor = h264.NewDTSExtractor()
-
-					var err error
-					dts, err = videoDTSExtractor.Extract(tunit.AU, pts)
-					if err != nil {
-						return err
-					}
-				} else {
-					if !idrPresent && !nonIDRPresent {
-						return nil
-					}
-
-					var err error
-					dts, err = videoDTSExtractor.Extract(tunit.AU, pts)
-					if err != nil {
-						return err
-					}
+				var err error
+				dts, err = videoDTSExtractor.Extract(tunit.AU, tunit.PTS)
+				if err != nil {
+					return err
 				}
+			}
 
-				c.nconn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout)))
-				return (*w).WriteH264(pts, dts, idrPresent, tunit.AU)
-			})
+			c.nconn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout)))
+			return (*w).WriteH264(tunit.PTS, dts, idrPresent, tunit.AU)
 		})
 
-		return videoMedia, videoFormatH264
+		return videoFormatH264
 	}
 
-	return nil, nil
+	return nil
 }
 
 func (c *rtmpConn) setupAudio(
 	w **rtmp.Writer,
 	stream *stream.Stream,
-	writer *asyncWriter,
-) (*description.Media, format.Format) {
-	var audioFormatMPEG4Generic *format.MPEG4AudioGeneric
-	audioMedia := stream.Desc().FindFormat(&audioFormatMPEG4Generic)
+	writer *asyncwriter.Writer,
+) format.Format {
+	var audioFormatMPEG4Audio *format.MPEG4Audio
+	audioMedia := stream.Desc().FindFormat(&audioFormatMPEG4Audio)
 
 	if audioMedia != nil {
-		stream.AddReader(c, audioMedia, audioFormatMPEG4Generic, func(u unit.Unit) {
-			writer.push(func() error {
-				tunit := u.(*unit.MPEG4AudioGeneric)
+		stream.AddReader(writer, audioMedia, audioFormatMPEG4Audio, func(u unit.Unit) error {
+			tunit := u.(*unit.MPEG4Audio)
 
-				if tunit.AUs == nil {
-					return nil
-				}
-
-				pts := tunit.PTS
-
-				for i, au := range tunit.AUs {
-					c.nconn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout)))
-					err := (*w).WriteMPEG4Audio(
-						pts+time.Duration(i)*mpeg4audio.SamplesPerAccessUnit*
-							time.Second/time.Duration(audioFormatMPEG4Generic.ClockRate()),
-						au,
-					)
-					if err != nil {
-						return err
-					}
-				}
-
+			if tunit.AUs == nil {
 				return nil
-			})
-		})
+			}
 
-		return audioMedia, audioFormatMPEG4Generic
-	}
-
-	var audioFormatMPEG4AudioLATM *format.MPEG4AudioLATM
-	audioMedia = stream.Desc().FindFormat(&audioFormatMPEG4AudioLATM)
-
-	if audioMedia != nil &&
-		audioFormatMPEG4AudioLATM.Config != nil &&
-		len(audioFormatMPEG4AudioLATM.Config.Programs) == 1 &&
-		len(audioFormatMPEG4AudioLATM.Config.Programs[0].Layers) == 1 {
-		stream.AddReader(c, audioMedia, audioFormatMPEG4AudioLATM, func(u unit.Unit) {
-			writer.push(func() error {
-				tunit := u.(*unit.MPEG4AudioLATM)
-
-				if tunit.AU == nil {
-					return nil
-				}
-
-				pts := tunit.PTS
-
+			for i, au := range tunit.AUs {
 				c.nconn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout)))
-				return (*w).WriteMPEG4Audio(pts, tunit.AU)
-			})
+				err := (*w).WriteMPEG4Audio(
+					tunit.PTS+time.Duration(i)*mpeg4audio.SamplesPerAccessUnit*
+						time.Second/time.Duration(audioFormatMPEG4Audio.ClockRate()),
+					au,
+				)
+				if err != nil {
+					return err
+				}
+			}
+
+			return nil
 		})
 
-		return audioMedia, audioFormatMPEG4AudioLATM
+		return audioFormatMPEG4Audio
 	}
 
 	var audioFormatMPEG1 *format.MPEG1Audio
 	audioMedia = stream.Desc().FindFormat(&audioFormatMPEG1)
 
 	if audioMedia != nil {
-		stream.AddReader(c, audioMedia, audioFormatMPEG1, func(u unit.Unit) {
-			writer.push(func() error {
-				tunit := u.(*unit.MPEG1Audio)
+		stream.AddReader(writer, audioMedia, audioFormatMPEG1, func(u unit.Unit) error {
+			tunit := u.(*unit.MPEG1Audio)
 
-				pts := tunit.PTS
+			pts := tunit.PTS
 
-				for _, frame := range tunit.Frames {
-					var h mpeg1audio.FrameHeader
-					err := h.Unmarshal(frame)
-					if err != nil {
-						return err
-					}
-
-					if !(!h.MPEG2 && h.Layer == 3) {
-						return fmt.Errorf("RTMP only supports MPEG-1 layer 3 audio")
-					}
-
-					c.nconn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout)))
-					err = (*w).WriteMPEG1Audio(pts, &h, frame)
-					if err != nil {
-						return err
-					}
-
-					pts += time.Duration(h.SampleCount()) *
-						time.Second / time.Duration(h.SampleRate)
+			for _, frame := range tunit.Frames {
+				var h mpeg1audio.FrameHeader
+				err := h.Unmarshal(frame)
+				if err != nil {
+					return err
 				}
 
-				return nil
-			})
+				if !(!h.MPEG2 && h.Layer == 3) {
+					return fmt.Errorf("RTMP only supports MPEG-1 layer 3 audio")
+				}
+
+				c.nconn.SetWriteDeadline(time.Now().Add(time.Duration(c.writeTimeout)))
+				err = (*w).WriteMPEG1Audio(pts, &h, frame)
+				if err != nil {
+					return err
+				}
+
+				pts += time.Duration(h.SampleCount()) *
+					time.Second / time.Duration(h.SampleRate)
+			}
+
+			return nil
 		})
 
-		return audioMedia, audioFormatMPEG1
+		return audioFormatMPEG1
 	}
 
-	return nil, nil
+	return nil
 }
 
 func (c *rtmpConn) runPublish(conn *rtmp.Conn, u *url.URL) error {
 	pathName, query, rawQuery := pathNameAndQuery(u)
 
 	res := c.pathManager.addPublisher(pathAddPublisherReq{
-		author:   c,
-		pathName: pathName,
-		credentials: authCredentials{
-			query: rawQuery,
-			ip:    c.ip(),
-			user:  query.Get("user"),
-			pass:  query.Get("pass"),
-			proto: authProtocolRTMP,
-			id:    &c.uuid,
+		author: c,
+		accessRequest: pathAccessRequest{
+			name:    pathName,
+			query:   rawQuery,
+			publish: true,
+			ip:      c.ip(),
+			user:    query.Get("user"),
+			pass:    query.Get("pass"),
+			proto:   authProtocolRTMP,
+			id:      &c.uuid,
 		},
 	})
 
@@ -593,9 +535,9 @@ func (c *rtmpConn) runPublish(conn *rtmp.Conn, u *url.URL) error {
 		medias = append(medias, audioMedia)
 
 		switch audioFormat.(type) {
-		case *format.MPEG4AudioGeneric:
+		case *format.MPEG4Audio:
 			r.OnDataMPEG4Audio(func(pts time.Duration, au []byte) {
-				stream.WriteUnit(audioMedia, audioFormat, &unit.MPEG4AudioGeneric{
+				stream.WriteUnit(audioMedia, audioFormat, &unit.MPEG4Audio{
 					Base: unit.Base{
 						NTP: time.Now(),
 						PTS: pts,
@@ -644,8 +586,8 @@ func (c *rtmpConn) runPublish(conn *rtmp.Conn, u *url.URL) error {
 }
 
 // apiReaderDescribe implements reader.
-func (c *rtmpConn) apiReaderDescribe() pathAPISourceOrReader {
-	return pathAPISourceOrReader{
+func (c *rtmpConn) apiReaderDescribe() defs.APIPathSourceOrReader {
+	return defs.APIPathSourceOrReader{
 		Type: func() string {
 			if c.isTLS {
 				return "rtmpsConn"
@@ -656,37 +598,37 @@ func (c *rtmpConn) apiReaderDescribe() pathAPISourceOrReader {
 	}
 }
 
-// apiSourceDescribe implements source.
-func (c *rtmpConn) apiSourceDescribe() pathAPISourceOrReader {
+// APISourceDescribe implements source.
+func (c *rtmpConn) APISourceDescribe() defs.APIPathSourceOrReader {
 	return c.apiReaderDescribe()
 }
 
-func (c *rtmpConn) apiItem() *apiRTMPConn {
+func (c *rtmpConn) apiItem() *defs.APIRTMPConn {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
 	bytesReceived := uint64(0)
 	bytesSent := uint64(0)
 
-	if c.conn != nil {
-		bytesReceived = c.conn.BytesReceived()
-		bytesSent = c.conn.BytesSent()
+	if c.rconn != nil {
+		bytesReceived = c.rconn.BytesReceived()
+		bytesSent = c.rconn.BytesSent()
 	}
 
-	return &apiRTMPConn{
+	return &defs.APIRTMPConn{
 		ID:         c.uuid,
 		Created:    c.created,
 		RemoteAddr: c.remoteAddr().String(),
-		State: func() apiRTMPConnState {
+		State: func() defs.APIRTMPConnState {
 			switch c.state {
 			case rtmpConnStateRead:
-				return apiRTMPConnStateRead
+				return defs.APIRTMPConnStateRead
 
 			case rtmpConnStatePublish:
-				return apiRTMPConnStatePublish
+				return defs.APIRTMPConnStatePublish
 
 			default:
-				return apiRTMPConnStateIdle
+				return defs.APIRTMPConnStateIdle
 			}
 		}(),
 		Path:          c.pathName,

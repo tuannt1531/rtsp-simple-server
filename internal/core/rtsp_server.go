@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
@@ -48,6 +49,7 @@ type rtspServer struct {
 	protocols           map[conf.Protocol]struct{}
 	runOnConnect        string
 	runOnConnectRestart bool
+	runOnDisconnect     string
 	externalCmdPool     *externalcmd.Pool
 	metrics             *metrics
 	pathManager         *pathManager
@@ -82,6 +84,7 @@ func newRTSPServer(
 	protocols map[conf.Protocol]struct{},
 	runOnConnect string,
 	runOnConnectRestart bool,
+	runOnDisconnect string,
 	externalCmdPool *externalcmd.Pool,
 	metrics *metrics,
 	pathManager *pathManager,
@@ -97,6 +100,7 @@ func newRTSPServer(
 		protocols:           protocols,
 		runOnConnect:        runOnConnect,
 		runOnConnectRestart: runOnConnectRestart,
+		runOnDisconnect:     runOnDisconnect,
 		externalCmdPool:     externalCmdPool,
 		metrics:             metrics,
 		pathManager:         pathManager,
@@ -214,11 +218,13 @@ outer:
 // OnConnOpen implements gortsplib.ServerHandlerOnConnOpen.
 func (s *rtspServer) OnConnOpen(ctx *gortsplib.ServerHandlerOnConnOpenCtx) {
 	c := newRTSPConn(
+		s.isTLS,
 		s.rtspAddress,
 		s.authMethods,
 		s.readTimeout,
 		s.runOnConnect,
 		s.runOnConnectRestart,
+		s.runOnDisconnect,
 		s.externalCmdPool,
 		s.pathManager,
 		ctx.Conn,
@@ -355,7 +361,7 @@ func (s *rtspServer) findSessionByUUID(uuid uuid.UUID) (*gortsplib.ServerSession
 }
 
 // apiConnsList is called by api and metrics.
-func (s *rtspServer) apiConnsList() (*apiRTSPConnsList, error) {
+func (s *rtspServer) apiConnsList() (*defs.APIRTSPConnsList, error) {
 	select {
 	case <-s.ctx.Done():
 		return nil, fmt.Errorf("terminated")
@@ -365,8 +371,8 @@ func (s *rtspServer) apiConnsList() (*apiRTSPConnsList, error) {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
-	data := &apiRTSPConnsList{
-		Items: []*apiRTSPConn{},
+	data := &defs.APIRTSPConnsList{
+		Items: []*defs.APIRTSPConn{},
 	}
 
 	for _, c := range s.conns {
@@ -381,7 +387,7 @@ func (s *rtspServer) apiConnsList() (*apiRTSPConnsList, error) {
 }
 
 // apiConnsGet is called by api.
-func (s *rtspServer) apiConnsGet(uuid uuid.UUID) (*apiRTSPConn, error) {
+func (s *rtspServer) apiConnsGet(uuid uuid.UUID) (*defs.APIRTSPConn, error) {
 	select {
 	case <-s.ctx.Done():
 		return nil, fmt.Errorf("terminated")
@@ -393,14 +399,14 @@ func (s *rtspServer) apiConnsGet(uuid uuid.UUID) (*apiRTSPConn, error) {
 
 	conn := s.findConnByUUID(uuid)
 	if conn == nil {
-		return nil, errAPINotFound
+		return nil, fmt.Errorf("connection not found")
 	}
 
 	return conn.apiItem(), nil
 }
 
 // apiSessionsList is called by api and metrics.
-func (s *rtspServer) apiSessionsList() (*apiRTSPSessionsList, error) {
+func (s *rtspServer) apiSessionsList() (*defs.APIRTSPSessionList, error) {
 	select {
 	case <-s.ctx.Done():
 		return nil, fmt.Errorf("terminated")
@@ -410,8 +416,8 @@ func (s *rtspServer) apiSessionsList() (*apiRTSPSessionsList, error) {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
-	data := &apiRTSPSessionsList{
-		Items: []*apiRTSPSession{},
+	data := &defs.APIRTSPSessionList{
+		Items: []*defs.APIRTSPSession{},
 	}
 
 	for _, s := range s.sessions {
@@ -426,7 +432,7 @@ func (s *rtspServer) apiSessionsList() (*apiRTSPSessionsList, error) {
 }
 
 // apiSessionsGet is called by api.
-func (s *rtspServer) apiSessionsGet(uuid uuid.UUID) (*apiRTSPSession, error) {
+func (s *rtspServer) apiSessionsGet(uuid uuid.UUID) (*defs.APIRTSPSession, error) {
 	select {
 	case <-s.ctx.Done():
 		return nil, fmt.Errorf("terminated")
@@ -438,7 +444,7 @@ func (s *rtspServer) apiSessionsGet(uuid uuid.UUID) (*apiRTSPSession, error) {
 
 	_, sx := s.findSessionByUUID(uuid)
 	if sx == nil {
-		return nil, errAPINotFound
+		return nil, fmt.Errorf("session not found")
 	}
 
 	return sx.apiItem(), nil
@@ -457,7 +463,7 @@ func (s *rtspServer) apiSessionsKick(uuid uuid.UUID) error {
 
 	key, sx := s.findSessionByUUID(uuid)
 	if sx == nil {
-		return errAPINotFound
+		return fmt.Errorf("session not found")
 	}
 
 	sx.close()

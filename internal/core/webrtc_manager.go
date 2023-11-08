@@ -16,103 +16,21 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pion/ice/v2"
-	"github.com/pion/interceptor"
-	"github.com/pion/webrtc/v3"
+	pwebrtc "github.com/pion/webrtc/v3"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/defs"
+	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
+	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
+	"github.com/bluenviron/mediamtx/internal/restrictnetwork"
 )
 
 const (
 	webrtcPauseAfterAuthError  = 2 * time.Second
-	webrtcHandshakeTimeout     = 10 * time.Second
-	webrtcTrackGatherTimeout   = 3 * time.Second
-	webrtcPayloadMaxSize       = 1188 // 1200 - 12 (RTP header)
-	webrtcStreamID             = "mediamtx"
 	webrtcTurnSecretExpiration = 24 * 3600 * time.Second
+	webrtcPayloadMaxSize       = 1188 // 1200 - 12 (RTP header)
 )
-
-var videoCodecs = []webrtc.RTPCodecParameters{
-	{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeAV1,
-			ClockRate: 90000,
-		},
-		PayloadType: 96,
-	},
-	{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeVP9,
-			ClockRate:   90000,
-			SDPFmtpLine: "profile-id=0",
-		},
-		PayloadType: 97,
-	},
-	{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeVP9,
-			ClockRate:   90000,
-			SDPFmtpLine: "profile-id=1",
-		},
-		PayloadType: 98,
-	},
-	{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeVP8,
-			ClockRate: 90000,
-		},
-		PayloadType: 99,
-	},
-	{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
-		},
-		PayloadType: 100,
-	},
-	{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-		},
-		PayloadType: 101,
-	},
-}
-
-var audioCodecs = []webrtc.RTPCodecParameters{
-	{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeOpus,
-			ClockRate:   48000,
-			Channels:    2,
-			SDPFmtpLine: "minptime=10;useinbandfec=1",
-		},
-		PayloadType: 111,
-	},
-	{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeG722,
-			ClockRate: 8000,
-		},
-		PayloadType: 9,
-	},
-	{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypePCMU,
-			ClockRate: 8000,
-		},
-		PayloadType: 0,
-	},
-	{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypePCMA,
-			ClockRate: 8000,
-		},
-		PayloadType: 8,
-	},
-}
 
 func randInt63() (int64, error) {
 	var b [8]byte
@@ -167,55 +85,8 @@ func randomTurnUser() (string, error) {
 	return string(b), nil
 }
 
-func webrtcNewAPI(
-	iceHostNAT1To1IPs []string,
-	iceUDPMux ice.UDPMux,
-	iceTCPMux ice.TCPMux,
-) (*webrtc.API, error) {
-	settingsEngine := webrtc.SettingEngine{}
-
-	if len(iceHostNAT1To1IPs) != 0 {
-		settingsEngine.SetNAT1To1IPs(iceHostNAT1To1IPs, webrtc.ICECandidateTypeHost)
-	}
-
-	if iceUDPMux != nil {
-		settingsEngine.SetICEUDPMux(iceUDPMux)
-	}
-
-	if iceTCPMux != nil {
-		settingsEngine.SetICETCPMux(iceTCPMux)
-		settingsEngine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeTCP4})
-	}
-
-	mediaEngine := &webrtc.MediaEngine{}
-
-	for _, codec := range videoCodecs {
-		err := mediaEngine.RegisterCodec(codec, webrtc.RTPCodecTypeVideo)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	for _, codec := range audioCodecs {
-		err := mediaEngine.RegisterCodec(codec, webrtc.RTPCodecTypeAudio)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	interceptorRegistry := &interceptor.Registry{}
-	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptorRegistry); err != nil {
-		return nil, err
-	}
-
-	return webrtc.NewAPI(
-		webrtc.WithSettingEngine(settingsEngine),
-		webrtc.WithMediaEngine(mediaEngine),
-		webrtc.WithInterceptorRegistry(interceptorRegistry)), nil
-}
-
 type webRTCManagerAPISessionsListRes struct {
-	data *apiWebRTCSessionsList
+	data *defs.APIWebRTCSessionList
 	err  error
 }
 
@@ -224,7 +95,7 @@ type webRTCManagerAPISessionsListReq struct {
 }
 
 type webRTCManagerAPISessionsGetRes struct {
-	data *apiWebRTCSession
+	data *defs.APIWebRTCSession
 	err  error
 }
 
@@ -245,8 +116,8 @@ type webRTCManagerAPISessionsKickReq struct {
 type webRTCNewSessionRes struct {
 	sx            *webRTCSession
 	answer        []byte
-	err           error
 	errStatusCode int
+	err           error
 }
 
 type webRTCNewSessionReq struct {
@@ -267,8 +138,17 @@ type webRTCAddSessionCandidatesRes struct {
 
 type webRTCAddSessionCandidatesReq struct {
 	secret     uuid.UUID
-	candidates []*webrtc.ICECandidateInit
+	candidates []*pwebrtc.ICECandidateInit
 	res        chan webRTCAddSessionCandidatesRes
+}
+
+type webRTCDeleteSessionRes struct {
+	err error
+}
+
+type webRTCDeleteSessionReq struct {
+	secret uuid.UUID
+	res    chan webRTCDeleteSessionRes
 }
 
 type webRTCManagerParent interface {
@@ -276,20 +156,21 @@ type webRTCManagerParent interface {
 }
 
 type webRTCManager struct {
-	allowOrigin    string
-	trustedProxies conf.IPsOrCIDRs
-	iceServers     []conf.WebRTCICEServer
-	writeQueueSize int
-	pathManager    *pathManager
-	metrics        *metrics
-	parent         webRTCManagerParent
+	allowOrigin     string
+	trustedProxies  conf.IPsOrCIDRs
+	iceServers      []conf.WebRTCICEServer
+	writeQueueSize  int
+	externalCmdPool *externalcmd.Pool
+	pathManager     *pathManager
+	metrics         *metrics
+	parent          webRTCManagerParent
 
 	ctx              context.Context
 	ctxCancel        func()
 	httpServer       *webRTCHTTPServer
 	udpMuxLn         net.PacketConn
 	tcpMuxLn         net.Listener
-	api              *webrtc.API
+	api              *pwebrtc.API
 	sessions         map[*webRTCSession]struct{}
 	sessionsBySecret map[uuid.UUID]*webRTCSession
 
@@ -297,6 +178,7 @@ type webRTCManager struct {
 	chNewSession           chan webRTCNewSessionReq
 	chCloseSession         chan *webRTCSession
 	chAddSessionCandidates chan webRTCAddSessionCandidatesReq
+	chDeleteSession        chan webRTCDeleteSessionReq
 	chAPISessionsList      chan webRTCManagerAPISessionsListReq
 	chAPISessionsGet       chan webRTCManagerAPISessionsGetReq
 	chAPIConnsKick         chan webRTCManagerAPISessionsKickReq
@@ -315,9 +197,11 @@ func newWebRTCManager(
 	iceServers []conf.WebRTCICEServer,
 	readTimeout conf.StringDuration,
 	writeQueueSize int,
+	iceInterfaces []string,
 	iceHostNAT1To1IPs []string,
 	iceUDPMuxAddress string,
 	iceTCPMuxAddress string,
+	externalCmdPool *externalcmd.Pool,
 	pathManager *pathManager,
 	metrics *metrics,
 	parent webRTCManagerParent,
@@ -329,6 +213,7 @@ func newWebRTCManager(
 		trustedProxies:         trustedProxies,
 		iceServers:             iceServers,
 		writeQueueSize:         writeQueueSize,
+		externalCmdPool:        externalCmdPool,
 		pathManager:            pathManager,
 		metrics:                metrics,
 		parent:                 parent,
@@ -339,6 +224,7 @@ func newWebRTCManager(
 		chNewSession:           make(chan webRTCNewSessionReq),
 		chCloseSession:         make(chan *webRTCSession),
 		chAddSessionCandidates: make(chan webRTCAddSessionCandidatesReq),
+		chDeleteSession:        make(chan webRTCDeleteSessionReq),
 		chAPISessionsList:      make(chan webRTCManagerAPISessionsListReq),
 		chAPISessionsGet:       make(chan webRTCManagerAPISessionsGetReq),
 		chAPIConnsKick:         make(chan webRTCManagerAPISessionsKickReq),
@@ -365,29 +251,34 @@ func newWebRTCManager(
 	var iceUDPMux ice.UDPMux
 
 	if iceUDPMuxAddress != "" {
-		m.udpMuxLn, err = net.ListenPacket(restrictNetwork("udp", iceUDPMuxAddress))
+		m.udpMuxLn, err = net.ListenPacket(restrictnetwork.Restrict("udp", iceUDPMuxAddress))
 		if err != nil {
 			m.httpServer.close()
 			ctxCancel()
 			return nil, err
 		}
-		iceUDPMux = webrtc.NewICEUDPMux(nil, m.udpMuxLn)
+		iceUDPMux = pwebrtc.NewICEUDPMux(nil, m.udpMuxLn)
 	}
 
 	var iceTCPMux ice.TCPMux
 
 	if iceTCPMuxAddress != "" {
-		m.tcpMuxLn, err = net.Listen(restrictNetwork("tcp", iceTCPMuxAddress))
+		m.tcpMuxLn, err = net.Listen(restrictnetwork.Restrict("tcp", iceTCPMuxAddress))
 		if err != nil {
 			m.udpMuxLn.Close()
 			m.httpServer.close()
 			ctxCancel()
 			return nil, err
 		}
-		iceTCPMux = webrtc.NewICETCPMux(nil, m.tcpMuxLn, 8)
+		iceTCPMux = pwebrtc.NewICETCPMux(nil, m.tcpMuxLn, 8)
 	}
 
-	m.api, err = webrtcNewAPI(iceHostNAT1To1IPs, iceUDPMux, iceTCPMux)
+	m.api, err = webrtc.NewAPI(webrtc.APIConf{
+		ICEInterfaces:     iceInterfaces,
+		ICEHostNAT1To1IPs: iceHostNAT1To1IPs,
+		ICEUDPMux:         iceUDPMux,
+		ICETCPMux:         iceTCPMux,
+	})
 	if err != nil {
 		m.udpMuxLn.Close()
 		m.tcpMuxLn.Close()
@@ -416,7 +307,7 @@ func newWebRTCManager(
 
 // Log is the main logging function.
 func (m *webRTCManager) Log(level logger.Level, format string, args ...interface{}) {
-	m.parent.Log(level, "[WebRTC] "+format, append([]interface{}{}, args...)...)
+	m.parent.Log(level, "[WebRTC] "+format, args...)
 }
 
 func (m *webRTCManager) close() {
@@ -440,6 +331,7 @@ outer:
 				m.api,
 				req,
 				&wg,
+				m.externalCmdPool,
 				m.pathManager,
 				m,
 			)
@@ -460,9 +352,22 @@ outer:
 
 			req.res <- webRTCAddSessionCandidatesRes{sx: sx}
 
+		case req := <-m.chDeleteSession:
+			sx, ok := m.sessionsBySecret[req.secret]
+			if !ok {
+				req.res <- webRTCDeleteSessionRes{err: fmt.Errorf("session not found")}
+				continue
+			}
+
+			delete(m.sessions, sx)
+			delete(m.sessionsBySecret, sx.secret)
+			sx.close()
+
+			req.res <- webRTCDeleteSessionRes{}
+
 		case req := <-m.chAPISessionsList:
-			data := &apiWebRTCSessionsList{
-				Items: []*apiWebRTCSession{},
+			data := &defs.APIWebRTCSessionList{
+				Items: []*defs.APIWebRTCSession{},
 			}
 
 			for sx := range m.sessions {
@@ -478,7 +383,7 @@ outer:
 		case req := <-m.chAPISessionsGet:
 			sx := m.findSessionByUUID(req.uuid)
 			if sx == nil {
-				req.res <- webRTCManagerAPISessionsGetRes{err: errAPINotFound}
+				req.res <- webRTCManagerAPISessionsGetRes{err: fmt.Errorf("session not found")}
 				continue
 			}
 
@@ -487,13 +392,14 @@ outer:
 		case req := <-m.chAPIConnsKick:
 			sx := m.findSessionByUUID(req.uuid)
 			if sx == nil {
-				req.res <- webRTCManagerAPISessionsKickRes{err: errAPINotFound}
+				req.res <- webRTCManagerAPISessionsKickRes{err: fmt.Errorf("session not found")}
 				continue
 			}
 
 			delete(m.sessions, sx)
 			delete(m.sessionsBySecret, sx.secret)
 			sx.close()
+
 			req.res <- webRTCManagerAPISessionsKickRes{}
 
 		case <-m.ctx.Done():
@@ -525,8 +431,8 @@ func (m *webRTCManager) findSessionByUUID(uuid uuid.UUID) *webRTCSession {
 	return nil
 }
 
-func (m *webRTCManager) generateICEServers() ([]webrtc.ICEServer, error) {
-	ret := make([]webrtc.ICEServer, len(m.iceServers))
+func (m *webRTCManager) generateICEServers() ([]pwebrtc.ICEServer, error) {
+	ret := make([]pwebrtc.ICEServer, len(m.iceServers))
 
 	for i, server := range m.iceServers {
 		if server.Username == "AUTH_SECRET" {
@@ -545,7 +451,7 @@ func (m *webRTCManager) generateICEServers() ([]webrtc.ICEServer, error) {
 			server.Password = base64.StdEncoding.EncodeToString(h.Sum(nil))
 		}
 
-		ret[i] = webrtc.ICEServer{
+		ret[i] = pwebrtc.ICEServer{
 			URLs:       []string{server.URL},
 			Username:   server.Username,
 			Credential: server.Password,
@@ -566,7 +472,10 @@ func (m *webRTCManager) newSession(req webRTCNewSessionReq) webRTCNewSessionRes 
 		return res.sx.new(req)
 
 	case <-m.ctx.Done():
-		return webRTCNewSessionRes{err: fmt.Errorf("terminated"), errStatusCode: http.StatusInternalServerError}
+		return webRTCNewSessionRes{
+			errStatusCode: http.StatusInternalServerError,
+			err:           fmt.Errorf("terminated"),
+		}
 	}
 }
 
@@ -597,8 +506,21 @@ func (m *webRTCManager) addSessionCandidates(
 	}
 }
 
+// deleteSession is called by webRTCHTTPServer.
+func (m *webRTCManager) deleteSession(req webRTCDeleteSessionReq) error {
+	req.res = make(chan webRTCDeleteSessionRes)
+	select {
+	case m.chDeleteSession <- req:
+		res := <-req.res
+		return res.err
+
+	case <-m.ctx.Done():
+		return fmt.Errorf("terminated")
+	}
+}
+
 // apiSessionsList is called by api.
-func (m *webRTCManager) apiSessionsList() (*apiWebRTCSessionsList, error) {
+func (m *webRTCManager) apiSessionsList() (*defs.APIWebRTCSessionList, error) {
 	req := webRTCManagerAPISessionsListReq{
 		res: make(chan webRTCManagerAPISessionsListRes),
 	}
@@ -614,7 +536,7 @@ func (m *webRTCManager) apiSessionsList() (*apiWebRTCSessionsList, error) {
 }
 
 // apiSessionsGet is called by api.
-func (m *webRTCManager) apiSessionsGet(uuid uuid.UUID) (*apiWebRTCSession, error) {
+func (m *webRTCManager) apiSessionsGet(uuid uuid.UUID) (*defs.APIWebRTCSession, error) {
 	req := webRTCManagerAPISessionsGetReq{
 		uuid: uuid,
 		res:  make(chan webRTCManagerAPISessionsGetRes),

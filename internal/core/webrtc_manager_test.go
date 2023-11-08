@@ -4,158 +4,41 @@ import (
 	"bytes"
 	"context"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v4"
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
-	"github.com/bluenviron/gortsplib/v4/pkg/url"
+	rtspurl "github.com/bluenviron/gortsplib/v4/pkg/url"
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
+	pwebrtc "github.com/pion/webrtc/v3"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bluenviron/mediamtx/internal/logger"
-	"github.com/bluenviron/mediamtx/internal/webrtcpc"
-	"github.com/bluenviron/mediamtx/internal/whip"
+	"github.com/bluenviron/mediamtx/internal/protocols/webrtc"
 )
 
-type nilLogger struct{}
+func TestWebRTCPages(t *testing.T) {
+	p, ok := newInstance("paths:\n" +
+		"  stream:\n")
+	require.Equal(t, true, ok)
+	defer p.Close()
 
-func (nilLogger) Log(_ logger.Level, _ string, _ ...interface{}) {
-}
+	hc := &http.Client{Transport: &http.Transport{}}
 
-type webRTCTestClient struct {
-	pc             *webrtcpc.PeerConnection
-	outgoingTrack1 *webrtc.TrackLocalStaticRTP
-	outgoingTrack2 *webrtc.TrackLocalStaticRTP
-	incomingTrack  chan *webrtc.TrackRemote
-}
-
-func newWebRTCTestClient(
-	t *testing.T,
-	hc *http.Client,
-	ur string,
-	publish bool,
-) *webRTCTestClient {
-	iceServers, err := whip.GetICEServers(context.Background(), hc, ur)
-	require.NoError(t, err)
-
-	c := &webRTCTestClient{}
-
-	api, err := webrtcNewAPI(nil, nil, nil)
-	require.NoError(t, err)
-
-	pc, err := webrtcpc.New(iceServers, api, nilLogger{})
-	require.NoError(t, err)
-
-	var outgoingTrack1 *webrtc.TrackLocalStaticRTP
-	var outgoingTrack2 *webrtc.TrackLocalStaticRTP
-	var incomingTrack chan *webrtc.TrackRemote
-
-	if publish {
-		var err error
-		outgoingTrack1, err = webrtc.NewTrackLocalStaticRTP(
-			webrtc.RTPCodecCapability{
-				MimeType:  webrtc.MimeTypeVP8,
-				ClockRate: 90000,
-			},
-			"vp8",
-			webrtcStreamID,
-		)
-		require.NoError(t, err)
-
-		_, err = pc.AddTrack(outgoingTrack1)
-		require.NoError(t, err)
-
-		outgoingTrack2, err = webrtc.NewTrackLocalStaticRTP(
-			webrtc.RTPCodecCapability{
-				MimeType:  webrtc.MimeTypeOpus,
-				ClockRate: 48000,
-				Channels:  2,
-			},
-			"opus",
-			webrtcStreamID,
-		)
-		require.NoError(t, err)
-
-		_, err = pc.AddTrack(outgoingTrack2)
-		require.NoError(t, err)
-	} else {
-		incomingTrack = make(chan *webrtc.TrackRemote, 1)
-		pc.OnTrack(func(trak *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
-			incomingTrack <- trak
-		})
-
-		_, err = pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo)
-		require.NoError(t, err)
-	}
-
-	offer, err := pc.CreateOffer(nil)
-	require.NoError(t, err)
-
-	res, err := whip.PostOffer(context.Background(), hc, ur, &offer)
-	require.NoError(t, err)
-
-	err = pc.SetLocalDescription(offer)
-	require.NoError(t, err)
-
-	// test adding additional candidates, even if it is not mandatory here
-outer:
-	for {
-		select {
-		case c := <-pc.NewLocalCandidate():
-			err := whip.PostCandidate(context.Background(), hc, ur, &offer, res.ETag, c)
+	for _, path := range []string{"/stream", "/stream/publish"} {
+		func() {
+			req, err := http.NewRequest(http.MethodGet, "http://localhost:8889"+path, nil)
 			require.NoError(t, err)
-		case <-pc.GatheringDone():
-			break outer
-		}
+
+			res, err := hc.Do(req)
+			require.NoError(t, err)
+			defer res.Body.Close()
+
+			require.Equal(t, http.StatusOK, res.StatusCode)
+		}()
 	}
-
-	err = pc.SetRemoteDescription(*res.Answer)
-	require.NoError(t, err)
-
-	<-pc.Connected()
-
-	if publish {
-		err := outgoingTrack1.WriteRTP(&rtp.Packet{
-			Header: rtp.Header{
-				Version:        2,
-				Marker:         true,
-				PayloadType:    96,
-				SequenceNumber: 123,
-				Timestamp:      45343,
-				SSRC:           563423,
-			},
-			Payload: []byte{1},
-		})
-		require.NoError(t, err)
-
-		err = outgoingTrack2.WriteRTP(&rtp.Packet{
-			Header: rtp.Header{
-				Version:        2,
-				Marker:         true,
-				PayloadType:    96,
-				SequenceNumber: 1123,
-				Timestamp:      45343,
-				SSRC:           563423,
-			},
-			Payload: []byte{2},
-		})
-		require.NoError(t, err)
-
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	c.pc = pc
-	c.outgoingTrack1 = outgoingTrack1
-	c.outgoingTrack2 = outgoingTrack2
-	c.incomingTrack = incomingTrack
-	return c
-}
-
-func (c *webRTCTestClient) close() {
-	c.pc.Close()
 }
 
 func TestWebRTCRead(t *testing.T) {
@@ -170,18 +53,18 @@ func TestWebRTCRead(t *testing.T) {
 			switch auth {
 			case "none":
 				conf = "paths:\n" +
-					"  all:\n"
+					"  all_others:\n"
 
 			case "internal":
 				conf = "paths:\n" +
-					"  all:\n" +
+					"  all_others:\n" +
 					"    readUser: myuser\n" +
 					"    readPass: mypass\n"
 
 			case "external":
 				conf = "externalAuthenticationURL: http://localhost:9120/auth\n" +
 					"paths:\n" +
-					"  all:\n"
+					"  all_others:\n"
 			}
 
 			p, ok := newInstance(conf)
@@ -238,27 +121,36 @@ func TestWebRTCRead(t *testing.T) {
 			}
 			ur += "localhost:8889/teststream/whep?param=value"
 
-			c := newWebRTCTestClient(t, hc, ur, false)
-			defer c.close()
+			go func() {
+				time.Sleep(500 * time.Millisecond)
 
-			time.Sleep(500 * time.Millisecond)
+				err := source.WritePacketRTP(medi, &rtp.Packet{
+					Header: rtp.Header{
+						Version:        2,
+						Marker:         true,
+						PayloadType:    96,
+						SequenceNumber: 123,
+						Timestamp:      45343,
+						SSRC:           563423,
+					},
+					Payload: []byte{5, 3},
+				})
+				require.NoError(t, err)
+			}()
 
-			err = source.WritePacketRTP(medi, &rtp.Packet{
-				Header: rtp.Header{
-					Version:        2,
-					Marker:         true,
-					PayloadType:    96,
-					SequenceNumber: 123,
-					Timestamp:      45343,
-					SSRC:           563423,
-				},
-				Payload: []byte{5, 3},
-			})
+			u, err := url.Parse(ur)
 			require.NoError(t, err)
 
-			trak := <-c.incomingTrack
+			c := &webrtc.WHIPClient{
+				HTTPClient: hc,
+				URL:        u,
+			}
 
-			pkt, _, err := trak.ReadRTP()
+			tracks, err := c.Read(context.Background())
+			require.NoError(t, err)
+			defer checkClose(t, c.Close)
+
+			pkt, err := tracks[0].ReadRTP()
 			require.NoError(t, err)
 			require.Equal(t, &rtp.Packet{
 				Header: rtp.Header{
@@ -278,28 +170,28 @@ func TestWebRTCRead(t *testing.T) {
 
 func TestWebRTCReadNotFound(t *testing.T) {
 	p, ok := newInstance("paths:\n" +
-		"  all:\n")
+		"  all_others:\n")
 	require.Equal(t, true, ok)
 	defer p.Close()
 
 	hc := &http.Client{Transport: &http.Transport{}}
 
-	iceServers, err := whip.GetICEServers(context.Background(), hc, "http://localhost:8889/stream/whep")
+	iceServers, err := webrtc.WHIPOptionsICEServers(context.Background(), hc, "http://localhost:8889/stream/whep")
 	require.NoError(t, err)
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+	pc, err := pwebrtc.NewPeerConnection(pwebrtc.Configuration{
 		ICEServers: iceServers,
 	})
 	require.NoError(t, err)
 	defer pc.Close() //nolint:errcheck
 
-	_, err = pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo)
+	_, err = pc.AddTransceiverFromKind(pwebrtc.RTPCodecTypeVideo)
 	require.NoError(t, err)
 
 	offer, err := pc.CreateOffer(nil)
 	require.NoError(t, err)
 
-	req, err := http.NewRequest("POST", "http://localhost:8889/stream/whep", bytes.NewReader([]byte(offer.SDP)))
+	req, err := http.NewRequest(http.MethodPost, "http://localhost:8889/stream/whep", bytes.NewReader([]byte(offer.SDP)))
 	require.NoError(t, err)
 
 	req.Header.Set("Content-Type", "application/sdp")
@@ -323,18 +215,18 @@ func TestWebRTCPublish(t *testing.T) {
 			switch auth {
 			case "none":
 				conf = "paths:\n" +
-					"  all:\n"
+					"  all_others:\n"
 
 			case "internal":
 				conf = "paths:\n" +
-					"  all:\n" +
+					"  all_others:\n" +
 					"    publishUser: myuser\n" +
 					"    publishPass: mypass\n"
 
 			case "external":
 				conf = "externalAuthenticationURL: http://localhost:9120/auth\n" +
 					"paths:\n" +
-					"  all:\n"
+					"  all_others:\n"
 			}
 
 			p, ok := newInstance(conf)
@@ -350,7 +242,7 @@ func TestWebRTCPublish(t *testing.T) {
 
 			// preflight requests must always work, without authentication
 			func() {
-				req, err := http.NewRequest("OPTIONS", "http://localhost:8889/teststream/whip", nil)
+				req, err := http.NewRequest(http.MethodOptions, "http://localhost:8889/teststream/whip", nil)
 				require.NoError(t, err)
 
 				req.Header.Set("Access-Control-Request-Method", "OPTIONS")
@@ -386,8 +278,32 @@ func TestWebRTCPublish(t *testing.T) {
 			}
 			ur += "localhost:8889/teststream/whip?param=value"
 
-			s := newWebRTCTestClient(t, hc, ur, true)
-			defer s.close()
+			su, err := url.Parse(ur)
+			require.NoError(t, err)
+
+			s := &webrtc.WHIPClient{
+				HTTPClient: hc,
+				URL:        su,
+			}
+
+			tracks, err := s.Publish(context.Background(), testMediaH264.Formats[0], nil)
+			require.NoError(t, err)
+			defer checkClose(t, s.Close)
+
+			err = tracks[0].WriteRTP(&rtp.Packet{
+				Header: rtp.Header{
+					Version:        2,
+					Marker:         true,
+					PayloadType:    96,
+					SequenceNumber: 123,
+					Timestamp:      45343,
+					SSRC:           563423,
+				},
+				Payload: []byte{1},
+			})
+			require.NoError(t, err)
+
+			time.Sleep(200 * time.Millisecond)
 
 			if auth == "external" {
 				a.close()
@@ -401,7 +317,7 @@ func TestWebRTCPublish(t *testing.T) {
 				},
 			}
 
-			u, err := url.Parse("rtsp://testreader:testpass@127.0.0.1:8554/teststream?param=value")
+			u, err := rtspurl.Parse("rtsp://testreader:testpass@127.0.0.1:8554/teststream?param=value")
 			require.NoError(t, err)
 
 			err = c.Start(u.Scheme, u.Host)
@@ -411,7 +327,7 @@ func TestWebRTCPublish(t *testing.T) {
 			desc, _, err := c.Describe(u)
 			require.NoError(t, err)
 
-			var forma *format.VP8
+			var forma *format.H264
 			medi := desc.FindFormat(&forma)
 
 			_, err = c.Setup(desc.BaseURL, medi, 0, 0)
@@ -427,7 +343,7 @@ func TestWebRTCPublish(t *testing.T) {
 			_, err = c.Play(nil)
 			require.NoError(t, err)
 
-			err = s.outgoingTrack1.WriteRTP(&rtp.Packet{
+			err = tracks[0].WriteRTP(&rtp.Packet{
 				Header: rtp.Header{
 					Version:        2,
 					Marker:         true,

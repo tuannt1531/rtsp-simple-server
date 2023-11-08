@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/mediamtx/internal/conf"
+	"github.com/bluenviron/mediamtx/internal/defs"
 	"github.com/bluenviron/mediamtx/internal/externalcmd"
 	"github.com/bluenviron/mediamtx/internal/logger"
 )
@@ -25,7 +26,7 @@ type srtNewConnReq struct {
 }
 
 type srtServerAPIConnsListRes struct {
-	data *apiSRTConnsList
+	data *defs.APISRTConnList
 	err  error
 }
 
@@ -34,7 +35,7 @@ type srtServerAPIConnsListReq struct {
 }
 
 type srtServerAPIConnsGetRes struct {
-	data *apiSRTConn
+	data *defs.APISRTConn
 	err  error
 }
 
@@ -57,13 +58,18 @@ type srtServerParent interface {
 }
 
 type srtServer struct {
-	readTimeout       conf.StringDuration
-	writeTimeout      conf.StringDuration
-	writeQueueSize    int
-	udpMaxPayloadSize int
-	externalCmdPool   *externalcmd.Pool
-	pathManager       *pathManager
-	parent            srtServerParent
+	rtspAddress         string
+	readTimeout         conf.StringDuration
+	writeTimeout        conf.StringDuration
+	writeQueueSize      int
+	udpMaxPayloadSize   int
+	runOnConnect        string
+	runOnConnectRestart bool
+	runOnDisconnect     string
+	externalCmdPool     *externalcmd.Pool
+	metrics             *metrics
+	pathManager         *pathManager
+	parent              srtServerParent
 
 	ctx       context.Context
 	ctxCancel func()
@@ -82,11 +88,16 @@ type srtServer struct {
 
 func newSRTServer(
 	address string,
+	rtspAddress string,
 	readTimeout conf.StringDuration,
 	writeTimeout conf.StringDuration,
 	writeQueueSize int,
 	udpMaxPayloadSize int,
+	runOnConnect string,
+	runOnConnectRestart bool,
+	runOnDisconnect string,
 	externalCmdPool *externalcmd.Pool,
+	metrics *metrics,
 	pathManager *pathManager,
 	parent srtServerParent,
 ) (*srtServer, error) {
@@ -102,26 +113,35 @@ func newSRTServer(
 	ctx, ctxCancel := context.WithCancel(context.Background())
 
 	s := &srtServer{
-		readTimeout:       readTimeout,
-		writeTimeout:      writeTimeout,
-		writeQueueSize:    writeQueueSize,
-		udpMaxPayloadSize: udpMaxPayloadSize,
-		externalCmdPool:   externalCmdPool,
-		pathManager:       pathManager,
-		parent:            parent,
-		ctx:               ctx,
-		ctxCancel:         ctxCancel,
-		ln:                ln,
-		conns:             make(map[*srtConn]struct{}),
-		chNewConnRequest:  make(chan srtNewConnReq),
-		chAcceptErr:       make(chan error),
-		chCloseConn:       make(chan *srtConn),
-		chAPIConnsList:    make(chan srtServerAPIConnsListReq),
-		chAPIConnsGet:     make(chan srtServerAPIConnsGetReq),
-		chAPIConnsKick:    make(chan srtServerAPIConnsKickReq),
+		rtspAddress:         rtspAddress,
+		readTimeout:         readTimeout,
+		writeTimeout:        writeTimeout,
+		writeQueueSize:      writeQueueSize,
+		udpMaxPayloadSize:   udpMaxPayloadSize,
+		runOnConnect:        runOnConnect,
+		runOnConnectRestart: runOnConnectRestart,
+		runOnDisconnect:     runOnDisconnect,
+		externalCmdPool:     externalCmdPool,
+		metrics:             metrics,
+		pathManager:         pathManager,
+		parent:              parent,
+		ctx:                 ctx,
+		ctxCancel:           ctxCancel,
+		ln:                  ln,
+		conns:               make(map[*srtConn]struct{}),
+		chNewConnRequest:    make(chan srtNewConnReq),
+		chAcceptErr:         make(chan error),
+		chCloseConn:         make(chan *srtConn),
+		chAPIConnsList:      make(chan srtServerAPIConnsListReq),
+		chAPIConnsGet:       make(chan srtServerAPIConnsGetReq),
+		chAPIConnsKick:      make(chan srtServerAPIConnsKickReq),
 	}
 
 	s.Log(logger.Info, "listener opened on "+address+" (UDP)")
+
+	if s.metrics != nil {
+		s.metrics.srtServerSet(s)
+	}
 
 	newSRTListener(
 		s.ln,
@@ -137,7 +157,7 @@ func newSRTServer(
 
 // Log is the main logging function.
 func (s *srtServer) Log(level logger.Level, format string, args ...interface{}) {
-	s.parent.Log(level, "[SRT] "+format, append([]interface{}{}, args...)...)
+	s.parent.Log(level, "[SRT] "+format, args...)
 }
 
 func (s *srtServer) close() {
@@ -159,11 +179,15 @@ outer:
 		case req := <-s.chNewConnRequest:
 			c := newSRTConn(
 				s.ctx,
+				s.rtspAddress,
 				s.readTimeout,
 				s.writeTimeout,
 				s.writeQueueSize,
 				s.udpMaxPayloadSize,
 				req.connReq,
+				s.runOnConnect,
+				s.runOnConnectRestart,
+				s.runOnDisconnect,
 				&s.wg,
 				s.externalCmdPool,
 				s.pathManager,
@@ -175,8 +199,8 @@ outer:
 			delete(s.conns, c)
 
 		case req := <-s.chAPIConnsList:
-			data := &apiSRTConnsList{
-				Items: []*apiSRTConn{},
+			data := &defs.APISRTConnList{
+				Items: []*defs.APISRTConn{},
 			}
 
 			for c := range s.conns {
@@ -192,7 +216,7 @@ outer:
 		case req := <-s.chAPIConnsGet:
 			c := s.findConnByUUID(req.uuid)
 			if c == nil {
-				req.res <- srtServerAPIConnsGetRes{err: errAPINotFound}
+				req.res <- srtServerAPIConnsGetRes{err: fmt.Errorf("connection not found")}
 				continue
 			}
 
@@ -201,7 +225,7 @@ outer:
 		case req := <-s.chAPIConnsKick:
 			c := s.findConnByUUID(req.uuid)
 			if c == nil {
-				req.res <- srtServerAPIConnsKickRes{err: errAPINotFound}
+				req.res <- srtServerAPIConnsKickRes{err: fmt.Errorf("connection not found")}
 				continue
 			}
 
@@ -263,7 +287,7 @@ func (s *srtServer) closeConn(c *srtConn) {
 }
 
 // apiConnsList is called by api.
-func (s *srtServer) apiConnsList() (*apiSRTConnsList, error) {
+func (s *srtServer) apiConnsList() (*defs.APISRTConnList, error) {
 	req := srtServerAPIConnsListReq{
 		res: make(chan srtServerAPIConnsListRes),
 	}
@@ -279,7 +303,7 @@ func (s *srtServer) apiConnsList() (*apiSRTConnsList, error) {
 }
 
 // apiConnsGet is called by api.
-func (s *srtServer) apiConnsGet(uuid uuid.UUID) (*apiSRTConn, error) {
+func (s *srtServer) apiConnsGet(uuid uuid.UUID) (*defs.APISRTConn, error) {
 	req := srtServerAPIConnsGetReq{
 		uuid: uuid,
 		res:  make(chan srtServerAPIConnsGetRes),
