@@ -100,7 +100,7 @@ type Conf struct {
 	RunOnConnectRestart       bool            `json:"runOnConnectRestart"`
 	RunOnDisconnect           string          `json:"runOnDisconnect"`
 
-	// RTSP
+	// RTSP server
 	RTSP              bool        `json:"rtsp"`
 	RTSPDisable       *bool       `json:"rtspDisable,omitempty"` // deprecated
 	Protocols         Protocols   `json:"protocols"`
@@ -116,7 +116,7 @@ type Conf struct {
 	ServerCert        string      `json:"serverCert"`
 	AuthMethods       AuthMethods `json:"authMethods"`
 
-	// RTMP
+	// RTMP server
 	RTMP           bool       `json:"rtmp"`
 	RTMPDisable    *bool      `json:"rtmpDisable,omitempty"` // deprecated
 	RTMPAddress    string     `json:"rtmpAddress"`
@@ -125,7 +125,7 @@ type Conf struct {
 	RTMPServerKey  string     `json:"rtmpServerKey"`
 	RTMPServerCert string     `json:"rtmpServerCert"`
 
-	// HLS
+	// HLS server
 	HLS                bool           `json:"hls"`
 	HLSDisable         *bool          `json:"hlsDisable,omitempty"` // depreacted
 	HLSAddress         string         `json:"hlsAddress"`
@@ -142,27 +142,31 @@ type Conf struct {
 	HLSTrustedProxies  IPsOrCIDRs     `json:"hlsTrustedProxies"`
 	HLSDirectory       string         `json:"hlsDirectory"`
 
-	// WebRTC
-	WebRTC                  bool              `json:"webrtc"`
-	WebRTCDisable           *bool             `json:"webrtcDisable,omitempty"` // deprecated
-	WebRTCAddress           string            `json:"webrtcAddress"`
-	WebRTCEncryption        bool              `json:"webrtcEncryption"`
-	WebRTCServerKey         string            `json:"webrtcServerKey"`
-	WebRTCServerCert        string            `json:"webrtcServerCert"`
-	WebRTCAllowOrigin       string            `json:"webrtcAllowOrigin"`
-	WebRTCTrustedProxies    IPsOrCIDRs        `json:"webrtcTrustedProxies"`
-	WebRTCICEServers        *[]string         `json:"webrtcICEServers,omitempty"` // deprecated
-	WebRTCICEServers2       []WebRTCICEServer `json:"webrtcICEServers2"`
-	WebRTCICEInterfaces     []string          `json:"webrtcICEInterfaces"`
-	WebRTCICEHostNAT1To1IPs []string          `json:"webrtcICEHostNAT1To1IPs"`
-	WebRTCICEUDPMuxAddress  string            `json:"webrtcICEUDPMuxAddress"`
-	WebRTCICETCPMuxAddress  string            `json:"webrtcICETCPMuxAddress"`
+	// WebRTC server
+	WebRTC                      bool              `json:"webrtc"`
+	WebRTCDisable               *bool             `json:"webrtcDisable,omitempty"` // deprecated
+	WebRTCAddress               string            `json:"webrtcAddress"`
+	WebRTCEncryption            bool              `json:"webrtcEncryption"`
+	WebRTCServerKey             string            `json:"webrtcServerKey"`
+	WebRTCServerCert            string            `json:"webrtcServerCert"`
+	WebRTCAllowOrigin           string            `json:"webrtcAllowOrigin"`
+	WebRTCTrustedProxies        IPsOrCIDRs        `json:"webrtcTrustedProxies"`
+	WebRTCLocalUDPAddress       string            `json:"webrtcLocalUDPAddress"`
+	WebRTCLocalTCPAddress       string            `json:"webrtcLocalTCPAddress"`
+	WebRTCIPsFromInterfaces     bool              `json:"webrtcIPsFromInterfaces"`
+	WebRTCIPsFromInterfacesList []string          `json:"webrtcIPsFromInterfacesList"`
+	WebRTCAdditionalHosts       []string          `json:"webrtcAdditionalHosts"`
+	WebRTCICEServers2           []WebRTCICEServer `json:"webrtcICEServers2"`
+	WebRTCICEUDPMuxAddress      *string           `json:"webrtcICEUDPMuxAddress,omitempty"`  // deprecated
+	WebRTCICETCPMuxAddress      *string           `json:"webrtcICETCPMuxAddress,omitempty"`  // deprecated
+	WebRTCICEHostNAT1To1IPs     *[]string         `json:"webrtcICEHostNAT1To1IPs,omitempty"` // deprecated
+	WebRTCICEServers            *[]string         `json:"webrtcICEServers,omitempty"`        // deprecated
 
-	// SRT
+	// SRT server
 	SRT        bool   `json:"srt"`
 	SRTAddress string `json:"srtAddress"`
 
-	// Record
+	// Record (deprecated)
 	Record                *bool           `json:"record,omitempty"`                // deprecated
 	RecordPath            *string         `json:"recordPath,omitempty"`            // deprecated
 	RecordFormat          *RecordFormat   `json:"recordFormat,omitempty"`          // deprecated
@@ -234,9 +238,11 @@ func (conf *Conf) setDefaults() {
 	conf.WebRTCServerKey = "server.key"
 	conf.WebRTCServerCert = "server.crt"
 	conf.WebRTCAllowOrigin = "*"
-	conf.WebRTCICEServers2 = []WebRTCICEServer{{URL: "stun:stun.l.google.com:19302"}}
-	conf.WebRTCICEInterfaces = []string{}
-	conf.WebRTCICEHostNAT1To1IPs = []string{}
+	conf.WebRTCLocalUDPAddress = ":8189"
+	conf.WebRTCIPsFromInterfaces = true
+	conf.WebRTCIPsFromInterfacesList = []string{}
+	conf.WebRTCAdditionalHosts = []string{}
+	conf.WebRTCICEServers2 = []WebRTCICEServer{}
 
 	// SRT
 	conf.SRT = true
@@ -382,6 +388,15 @@ func (conf *Conf) Check() error {
 	if conf.WebRTCDisable != nil {
 		conf.WebRTC = !*conf.WebRTCDisable
 	}
+	if conf.WebRTCICEUDPMuxAddress != nil {
+		conf.WebRTCLocalUDPAddress = *conf.WebRTCICEUDPMuxAddress
+	}
+	if conf.WebRTCICETCPMuxAddress != nil {
+		conf.WebRTCLocalTCPAddress = *conf.WebRTCICETCPMuxAddress
+	}
+	if conf.WebRTCICEHostNAT1To1IPs != nil {
+		conf.WebRTCAdditionalHosts = *conf.WebRTCICEHostNAT1To1IPs
+	}
 	if conf.WebRTCICEServers != nil {
 		for _, server := range *conf.WebRTCICEServers {
 			parts := strings.Split(server, ":")
@@ -403,6 +418,17 @@ func (conf *Conf) Check() error {
 			!strings.HasPrefix(server.URL, "turn:") &&
 			!strings.HasPrefix(server.URL, "turns:") {
 			return fmt.Errorf("invalid ICE server: '%s'", server.URL)
+		}
+	}
+	if conf.WebRTCLocalUDPAddress == "" &&
+		conf.WebRTCLocalTCPAddress == "" &&
+		len(conf.WebRTCICEServers2) == 0 {
+		return fmt.Errorf("at least one between 'webrtcLocalUDPAddress'," +
+			" 'webrtcLocalTCPAddress' or 'webrtcICEServers2' must be filled")
+	}
+	if conf.WebRTCLocalUDPAddress != "" || conf.WebRTCLocalTCPAddress != "" {
+		if !conf.WebRTCIPsFromInterfaces && len(conf.WebRTCAdditionalHosts) == 0 {
+			return fmt.Errorf("at least one between 'webrtcIPsFromInterfaces' or 'webrtcAdditionalHosts' must be filled")
 		}
 	}
 

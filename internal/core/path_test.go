@@ -19,7 +19,6 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/bluenviron/gortsplib/v4/pkg/headers"
 	"github.com/bluenviron/gortsplib/v4/pkg/sdp"
-	rtspurl "github.com/bluenviron/gortsplib/v4/pkg/url"
 	"github.com/datarhei/gosrt"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
@@ -126,7 +125,7 @@ func TestPathRunOnDemand(t *testing.T) {
 				br := bufio.NewReader(conn)
 
 				if ca == "describe" || ca == "describe and setup" {
-					u, err := rtspurl.Parse("rtsp://localhost:8554/ondemand?param=value")
+					u, err := base.ParseURL("rtsp://localhost:8554/ondemand?param=value")
 					require.NoError(t, err)
 
 					byts, _ := base.Request{
@@ -153,7 +152,7 @@ func TestPathRunOnDemand(t *testing.T) {
 				}
 
 				if ca == "setup" || ca == "describe and setup" {
-					u, err := rtspurl.Parse(control)
+					u, err := base.ParseURL(control)
 					require.NoError(t, err)
 
 					byts, _ := base.Request{
@@ -328,7 +327,7 @@ func TestPathRunOnRead(t *testing.T) {
 				case "rtsp":
 					reader := gortsplib.Client{}
 
-					u, err := rtspurl.Parse("rtsp://127.0.0.1:8554/test?query=value")
+					u, err := base.ParseURL("rtsp://127.0.0.1:8554/test?query=value")
 					require.NoError(t, err)
 
 					err = reader.Start(u.Scheme, u.Host)
@@ -360,7 +359,7 @@ func TestPathRunOnRead(t *testing.T) {
 
 				case "srt":
 					conf := srt.DefaultConfig()
-					address, err := conf.UnmarshalURL("srt://localhost:8890?streamid=read:test")
+					address, err := conf.UnmarshalURL("srt://localhost:8890?streamid=read:test:query=value")
 					require.NoError(t, err)
 
 					err = conf.Validate()
@@ -391,19 +390,11 @@ func TestPathRunOnRead(t *testing.T) {
 
 			byts, err := os.ReadFile(onReadFile)
 			require.NoError(t, err)
-			if ca == "srt" {
-				require.Equal(t, "test \n", string(byts))
-			} else {
-				require.Equal(t, "test query=value\n", string(byts))
-			}
+			require.Equal(t, "test query=value\n", string(byts))
 
 			byts, err = os.ReadFile(onUnreadFile)
 			require.NoError(t, err)
-			if ca == "srt" {
-				require.Equal(t, "test \n", string(byts))
-			} else {
-				require.Equal(t, "test query=value\n", string(byts))
-			}
+			require.Equal(t, "test query=value\n", string(byts))
 		})
 	}
 }
@@ -428,7 +419,7 @@ func TestPathMaxReaders(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		reader := gortsplib.Client{}
 
-		u, err := rtspurl.Parse("rtsp://127.0.0.1:8554/mystream")
+		u, err := base.ParseURL("rtsp://127.0.0.1:8554/mystream")
 		require.NoError(t, err)
 
 		err = reader.Start(u.Scheme, u.Host)
@@ -523,4 +514,59 @@ func TestPathRecord(t *testing.T) {
 	files, err = os.ReadDir(filepath.Join(dir, "mystream"))
 	require.NoError(t, err)
 	require.Equal(t, 2, len(files))
+}
+
+func TestPathFallback(t *testing.T) {
+	for _, ca := range []string{
+		"absolute",
+		"relative",
+		"source",
+	} {
+		t.Run(ca, func(t *testing.T) {
+			var conf string
+
+			switch ca {
+			case "absolute":
+				conf = "paths:\n" +
+					"  path1:\n" +
+					"    fallback: rtsp://localhost:8554/path2\n" +
+					"  path2:\n"
+
+			case "relative":
+				conf = "paths:\n" +
+					"  path1:\n" +
+					"    fallback: /path2\n" +
+					"  path2:\n"
+
+			case "source":
+				conf = "paths:\n" +
+					"  path1:\n" +
+					"    fallback: /path2\n" +
+					"    source: rtsp://localhost:3333/nonexistent\n" +
+					"  path2:\n"
+			}
+
+			p1, ok := newInstance(conf)
+			require.Equal(t, true, ok)
+			defer p1.Close()
+
+			source := gortsplib.Client{}
+			err := source.StartRecording("rtsp://localhost:8554/path2",
+				&description.Session{Medias: []*description.Media{testMediaH264}})
+			require.NoError(t, err)
+			defer source.Close()
+
+			u, err := base.ParseURL("rtsp://localhost:8554/path1")
+			require.NoError(t, err)
+
+			dest := gortsplib.Client{}
+			err = dest.Start(u.Scheme, u.Host)
+			require.NoError(t, err)
+			defer dest.Close()
+
+			desc, _, err := dest.Describe(u)
+			require.NoError(t, err)
+			require.Equal(t, 1, len(desc.Medias))
+		})
+	}
 }
